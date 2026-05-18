@@ -1,43 +1,41 @@
-# PRD: Hermes Local Long-Duration Memory System
+# PRD: Hermes Local Memory Pack
 
-**Document:** `prd.md`  
-**Product Name:** Hermes Local Memory Pack  
-**Owner:** David McCarty  
-**Version:** 0.1  
-**Date:** 2026-05-17  
-**Status:** Draft for build planning
+**Document:** `prd.md`
+**Project:** `hermes-memory`
+**Owner:** David McCarty
+**Version:** 0.2 (rewrite — see `docs/archive/v0.1-original/` for v0.1 + introspection)
+**Date:** 2026-05-17
+**Status:** Draft for design lock-in
 
 ---
 
 ## 1. Executive Summary
 
-Hermes Local Memory Pack is a local-first, no-additional-cost memory system for Hermes Agent that provides long-duration recall, lossless historical chat preservation, searchable working memory, durable user/project facts, and recursive “dreaming” consolidation.
+Hermes Local Memory Pack is a **local-first, no-additional-cost long-duration memory subsystem** for the Hermes Agent. It captures every conversation turn losslessly, indexes them for both exact-keyword and semantic search, extracts durable facts through a nightly local "dreamer" process, and exposes a single, unified memory tool surface so the agent never has to know which storage backend produced a given result.
 
-The system is intended to approximate the strongest capabilities of cloud memory systems such as Honcho while avoiding token-metered SaaS dependency. It will preserve every conversation turn and tool event in a lossless archive, generate daily and project-level memory files, index all history with both semantic vector search and exact keyword search, expose agent tools for recall/write/update operations, and run a scheduled local consolidation process that extracts durable facts, decisions, contradictions, unresolved questions, and project memory updates.
+The system ships as a **new Hermes `MemoryProvider` plugin** (`plugins/memory/hermes-local/`), activated by a single config flip (`memory.provider: hermes-local`). For heavy queries, source resolution, and the dreamer process, the plugin delegates to a local **FastAPI gateway service**. Both share one SQLite database, one Qdrant collection set, and one filesystem layout under `~/.hermes/memory/`.
 
-This PRD assumes Hermes built-in memory files remain active and are enhanced by a local memory bridge. Hermes documentation describes external memory providers as additive to built-in `MEMORY.md` / `USER.md`, with provider context injected, relevant memories prefetched, turns synced, and provider tools added. The local system should follow the same conceptual pattern while using local services and files.
+This PRD replaces v0.1 and incorporates the v0.1 introspection critique, deep-scrub findings on the existing holographic plugin, the diagnosed root-cause of the `/new` narrative-thread injection bug, and the user's locked design decisions.
 
 ---
 
 ## 2. Problem Statement
 
-Hermes built-in memory is useful for concise durable context, but it is not sufficient by itself for the user’s desired long-duration memory system.
+Hermes' built-in memory is useful for compact durable context but is not sufficient for the user's desired long-duration memory:
 
-The user wants a system similar to OpenClaw’s “lossless claw” and QMD-style memory approach, including:
+- The existing `holographic` plugin stores facts in `memory_store.db` but does not preserve raw chat history, has no semantic retrieval, and produces no daily/project memory artifacts.
+- Cloud providers (Honcho, Mem0 Cloud) cost per token and conflict with the local-first preference.
+- The OpenClaw `lossless-claw` + `enhanced-memory` pattern has proven the model locally but has never been ported to Hermes.
 
-- Complete historical chat turns
-- Durable user and project facts
-- Exact keyword lookup
-- Semantic vector search
-- Daily memory files
-- Project memory files
-- Session memory files
-- Recursive review/dreaming
-- Local-first storage
-- No recurring token-metered memory provider cost
-- Agent-accessible recall and write tools
+What the user needs:
 
-Cloud systems such as Honcho offer attractive user modeling and recursive memory features, but the user prefers a local solution with no incremental per-token charges.
+1. Lossless preservation of every chat turn.
+2. Both exact-string search (config keys, error strings, command snippets) and semantic search (concepts, "what did we decide about X").
+3. Durable, source-traceable facts and decisions.
+4. Recursive consolidation ("dreaming") that updates daily / project memory files automatically.
+5. Per-session "narrative thread" that survives `/new`, `/resume`, and context compaction.
+6. Zero recurring SaaS / token-metered cost.
+7. One tool surface inside Hermes — no risk that the agent drifts back to a default tool.
 
 ---
 
@@ -45,148 +43,319 @@ Cloud systems such as Honcho offer attractive user modeling and recursive memory
 
 ### 3.1 Product Goals
 
-1. Preserve every Hermes chat turn and tool interaction in a lossless local archive.
-2. Provide searchable long-term memory across all historical chats.
-3. Maintain concise durable memory files for Hermes built-in context.
-4. Maintain daily, session, project, entity, fact, decision, and open-question memory files.
-5. Provide hybrid retrieval:
-   - Vector semantic search
-   - Exact keyword search
-   - Metadata filtering
-   - Date/session/project filtering
-6. Provide a local “dreaming” process that recursively reviews new history and updates summaries/facts.
-7. Expose memory functions to Hermes through tools or MCP.
-8. Keep all private data local by default.
-9. Avoid recurring SaaS/token-metered memory costs.
-10. Preserve portability by keeping human-readable Markdown/QMD and JSONL as the source of truth.
+1. **Lossless capture** — every user / assistant / system / tool turn lands in append-only JSONL.
+2. **Dual indexing** — SQLite FTS5 for keywords; Qdrant for semantic.
+3. **Hybrid retrieval** — one query merges FTS + Qdrant + Jaccard + HRR + trust + recency, with graceful degradation if any backend is down.
+4. **Source traceability** — every returned result carries a `source_ref` that resolves back to raw content.
+5. **Local dreaming** — nightly cron extracts facts, decisions, open questions, contradictions, daily summaries, project memory updates.
+6. **Single tool surface** — `memory_query`, `memory_write`, `memory_update`, `memory_get_source`, `memory_recent_context`, `memory_dream_now`.
+7. **Provider swap** — activating this provider unregisters holographic/`fact_store` automatically (Hermes core enforces single external provider).
+8. **Schema independence** — we own our SQLite file end-to-end; we only touch Hermes core via documented public APIs.
+9. **Narrative thread that actually works on `/new`** — prior session content is injected on the next turn (via user message, bypassing the cached-system-prompt limitation).
+10. **Idempotent operations** — capture, indexing, and dreaming all safe to re-run.
 
 ### 3.2 User Experience Goals
 
-The user should be able to ask Hermes questions such as:
+The user can ask Hermes any of the following and get a useful, source-cited answer:
 
-- “What did we decide about Hermes memory last week?”
-- “Find the exact OpenClaw error I pasted about `agents.list.0.tools`.”
-- “What hardware do I currently have in the AI lab?”
-- “Summarize everything we discussed about Qdrant and meeting transcripts.”
-- “What changed in my local AI architecture over time?”
-- “Show me all open questions about using Mem0 OSS.”
-- “Update the project memory for Hermes with this new decision.”
-- “Dream on today’s sessions and update daily/project memory.”
+- "What did we decide about Hermes memory last week?"
+- "Find the exact OpenClaw error I pasted about `agents.list.0.tools`."
+- "What hardware do I currently have in the AI lab?"
+- "Summarize everything we discussed about Qdrant and meeting transcripts."
+- "Show me all open questions about using Mem0 OSS."
+- "Update the project memory for Hermes with this new decision."
+- "Dream on today's sessions and update daily/project memory."
 
-Hermes should answer with relevant citations or references back to source sessions/files whenever possible.
+After `/new`, the assistant's first response should briefly reference the prior session's focus and ask whether to continue from there.
 
 ---
 
-## 4. Non-Goals
+## 4. Non-Goals (MVP)
 
-The first release will not attempt to:
-
-1. Replace Hermes as the primary agent runtime.
+1. Replace `hermes_state.py` / Hermes' session DB.
 2. Replace OpenClaw memory.
-3. Build a paid hosted memory SaaS.
-4. Store secrets, API keys, passwords, tokens, or sensitive credentials.
+3. Build a hosted SaaS.
+4. Store secrets, API keys, passwords, tokens.
 5. Guarantee perfect fact extraction without human review.
-6. Solve enterprise-scale multi-user governance in v1.
-7. Implement full graph reasoning in the MVP unless it is low effort after the core stack is stable.
-8. Ingest every external data source immediately.
-9. Depend on cloud LLM APIs for core memory operations.
-10. Rewrite raw history during consolidation.
+6. Solve enterprise multi-user governance.
+7. Implement full graph reasoning in MVP.
+8. Ingest arbitrary external data sources (files, NAS, transcripts).
+9. Depend on any cloud LLM API.
+10. Rewrite raw history during consolidation (raw is immutable).
+11. Provide a web dashboard (post-MVP).
+12. Cross-agent memory bus for OpenClaw / Agent Zero (post-MVP).
 
 ---
 
+## 5. Architecture Overview
+
+```text
+                +-----------------------------+
+                | Hermes Agent (in-process)   |
+                |                             |
+                |  AIAgent + MemoryManager    |
+                +--------------+--------------+
+                               |
+                               | activates exactly one MemoryProvider
+                               v
+                +-----------------------------+
+                | hermes-local plugin         |  <-- this project
+                |  (MemoryProvider impl)      |
+                |                             |
+                | * sync_turn() write path    |
+                | * on_session_switch()       |
+                | * tool schemas + dispatch   |
+                | * narrative thread          |
+                +-------+-------------+-------+
+                        |             |
+        in-process call |             | HTTP (heavy queries, dream, source)
+                        v             v
+                +-----------------------------+
+                | memory_core library         |  <-- shared
+                |                             |
+                | * SQLite (sessions, turns,  |
+                |   chunks, facts, decisions, |
+                |   open_questions, dream_    |
+                |   runs, raw_events) + FTS5  |
+                | * Qdrant client             |
+                | * LMS embeddings client     |
+                | * Hybrid scorer             |
+                | * Redaction guard           |
+                | * Source resolver           |
+                +---------------+-------------+
+                                |
+                +---------------+---------------+
+                |               |               |
+                v               v               v
+        SQLite file       Qdrant @ :6333   ~/.hermes/memory/
+   memory.sqlite          collections      raw/, qmd/, daily/,
+   (WAL + FTS5)           (nomic v1.5)     projects/, dreams/
+
+                +-----------------------------+
+                | hermes-memory-gateway        |  (FastAPI, optional service)
+                |                             |
+                | * /memory/query             |
+                | * /memory/write             |
+                | * /memory/source/{ref}      |
+                | * /memory/dream             |
+                | * /memory/reindex           |
+                | * /health                   |
+                +---------------+-------------+
+                                |
+                                v
+                        same memory_core lib
+
+                +-----------------------------+
+                | Dreamer cron (3am nightly)  |
+                |                             |
+                | Calls Qwen3.6-35B @ .105    |
+                | Reads new turns, writes via |
+                | memory_write through        |
+                | memory_core                 |
+                +-----------------------------+
+```
+
+### 5.1 Centralized Access Rule (carried from v0.1)
+
+Hermes interacts with memory through **one** programmatic interface — the plugin's registered tools. Every backend (SQLite, Qdrant, files, dreamer outputs) is a private implementation detail behind that interface.
+
+Why this matters for v0.2: we have explicit leverage. Hermes' `MemoryProvider` contract enforces single-provider — when `hermes-local` is active, `fact_store` and other provider tools are not registered. The agent literally cannot call them. No skill-wrapping, no soul.md nudging, no hoping the agent picks the right tool.
+
 ---
 
-## 4A. Central Memory Control Plane Requirement
+## 6. Personas
 
-The system shall not behave as a loose collection of disconnected memory stores. Hermes, OpenClaw, Agent Zero, or any other agent runtime shall interact with memory through one central programmable memory interface.
+### 6.1 Primary: Local AI Power User (David)
 
-The central interface is the **Local Memory Gateway**.
+- Builds self-hosted AI lab; uses Hermes daily across CLI + Telegram + TUI.
+- Local-first; rejects per-token cloud memory cost.
+- Wants high-recall, source-cited answers across months of conversation history.
+- Edits memory files by hand when needed.
 
-The Local Memory Gateway is the authoritative memory control plane. It exposes a small set of tools/functions and internally fans out to the underlying memory stores, indexes, and derived files.
+### 6.2 Secondary: Hermes Agent (in-process consumer)
 
-### 4A.1 Control Plane Principle
+- Needs: fast prefetch, structured query results, write tools, source-traced facts.
+- Hard constraint: no surprise schema breaks, no missing tool surfaces.
 
-```text
-Hermes shall not directly query Qdrant, SQLite, JSONL, QMD, daily files, project files, Mem0, or graph memory independently.
+### 6.3 Secondary: Dreamer (automated process)
 
-Hermes shall call one central memory layer.
+- Runs from cron at 3am.
+- Needs: access to unprocessed turns, idempotent batches, checkpointing, contradiction detection, ability to update derived memory + indexes.
 
-The Local Memory Gateway shall route, merge, deduplicate, rank, source-trace, and return normalized memory results.
-```
+---
 
-### 4A.2 Canonical Memory Interface
+## 7. Scope
 
-The core interface shall include:
+### 7.1 MVP Scope (Phases 1–6 in `Plan.md`)
 
-```text
-memory_query()
-memory_write()
-memory_get_source()
-memory_recent_context()
-memory_dream()
-memory_reindex()
-memory_update()
-```
+1. Hermes plugin: `plugins/memory/hermes-local/` (capture + tools).
+2. FastAPI gateway: `hermes-memory-gateway` (queries, source, dream).
+3. Shared `memory_core/` library (used by both).
+4. JSONL append-only archive.
+5. QMD/Markdown session export.
+6. Own SQLite database (`~/.hermes/memory/memory.sqlite`) with full schema.
+7. SQLite FTS5 for keyword search.
+8. Qdrant integration with `nomic-embed-text-v1.5@f16` (768d, LMS `:1235`).
+9. Hybrid scorer with graceful degradation.
+10. Forked HRR lib for `probe` / `related` / `reason` compositional queries.
+11. Redaction guard in Phase 1.
+12. Source resolver.
+13. Dreamer v1 with Qwen3.6-35B at `192.168.2.105`.
+14. Daily memory files (`~/.hermes/memories/YYYY-MM-DD.md`).
+15. Per-project memory files.
+16. Narrative thread with fixed `/new` injection.
+17. Memory CLI (`memory init`, `db init`, `search`, `dream`, `backup`, `rebuild-indexes`).
+18. One-shot migration from holographic `memory_store.db`.
+19. Backup + index rebuild from raw JSONL.
 
-These tools shall be available through one or more of:
+### 7.2 Post-MVP (deferred)
 
-- local HTTP API
-- CLI
-- MCP server
-- Hermes custom memory provider adapter
+- Mem0 OSS as optional adaptive mirror
+- Graph memory (Kùzu / Neo4j)
+- Web dashboard
+- Cross-agent memory bus (OpenClaw, Agent Zero)
+- Document / transcript ingestion
+- Local re-ranker
+- LLM-based contradiction detection
+- Memory review queue
+- Per-project confidence thresholds
 
-### 4A.3 Backend Stores Are Not Independent Memories
+---
 
-The system shall treat each backend as a storage/index/view layer:
+## 8. Functional Requirements
 
-| Backend | Role |
+### FR-001: Lossless Chat Capture
+
+Every Hermes turn shall append a record to `memory/raw/YYYY/YYYY-MM-DD/{session_id}.jsonl` with:
+`event_id`, `session_id`, `turn_id`, `sequence`, `timestamp`, `role`, `content`, `agent`, `project`, `source`, `tags`, `tool_calls`, `attachments`, `metadata`, `hash`, `parent_turn_id`, `embedding_status`, `index_status`, `dream_status`.
+
+Acceptance: no content loss under normal operation; duplicate events (matching hash) are deduplicated, not lost.
+
+### FR-002: Human-Readable Session Export
+
+The system shall export each session to QMD/Markdown under `memory/qmd/YYYY/YYYY-MM-DD/` with frontmatter, chronological turns, tool call summaries, source refs, tags.
+
+### FR-003: Daily Memory Files
+
+The system shall maintain one daily file per date at `~/.hermes/memories/YYYY-MM-DD.md` containing sessions processed, major topics, durable facts discovered, decisions made, unresolved questions, follow-up actions, changed project memories, source references.
+
+### FR-004: Project Memory Files
+
+The system shall maintain per-project memory folders at `~/.hermes/memory/projects/<project>/` with `memory.md`, `facts.md`, `decisions.md`, `open_questions.md`, `timeline.md`, `sources.md`. Seeded projects: `hermes`, `hermes-memory`, `openclaw`, `local-ai-lab`, `personal-ai`. Auto-create on first reference.
+
+### FR-005: Fact Store
+
+Durable facts shall be stored in SQLite with: text, confidence, scope, project, entity, source refs (array), first/last seen, status (`active`/`superseded`/`disputed`/`archived`), supersedes / superseded_by, tags, retrieval/helpful counters, HRR vector (BLOB).
+
+### FR-006: Decision Store
+
+Decisions stored with: text, rationale, project, date, source refs, owner, status, implications, related fact IDs.
+
+### FR-007: Open Questions
+
+Open questions stored with: text, project, priority, status, source refs, created date, next action.
+
+### FR-008: Semantic Search
+
+Qdrant collections versioned by embedding model (e.g. `hermes_memory_chunks_nomic_v15`). Payload indexes on `project`, `date`, `memory_type`, `session_id`, `tags`, `status`. Filterable on all of these.
+
+### FR-009: Keyword Search
+
+SQLite FTS5 over turns, chunks, facts, decisions, open questions. Must handle exact strings: config keys, error messages, model names, hardware names, filenames, commands, URLs, code snippets.
+
+### FR-010: Hybrid Search
+
+Default `memory_query` mode. Combines FTS + Qdrant + Jaccard + HRR + trust + freshness with mode-driven weight adjustment. Returns results in normalized result shape (see §10). **Must auto-redistribute weights and remain functional if Qdrant, LMS embeddings, or HRR (numpy) is down.**
+
+### FR-011: Local Dreamer
+
+Nightly 3am cron + manual trigger (`memory_dream_now`) + optional session-end. Loads new turns since last checkpoint, generates session/daily summaries via Qwen3.6-35B at `192.168.2.105`, extracts candidate facts/decisions/questions, detects contradictions via entity+project bucket comparison (heuristic v1), writes derived memory through the canonical write path, refreshes indexes, writes a dream report to `memory/dreams/YYYY-MM-DD-HHMM.md`. Never overwrites raw.
+
+### FR-012: Hermes Tool Interface
+
+The plugin shall expose ONLY these tools to Hermes:
+
+- `memory_query(query, mode?, project?, filters?, limit?)` — default hybrid; modes: `hybrid`, `semantic`, `keyword`, `facts`, `decisions`, `open_questions`, `sessions`, `daily`, `project`, `recent`, `probe`, `related`, `reason`.
+- `memory_write(type, text, source_ref, project?, ...)` — types: `fact`, `decision`, `open_question`. Returns `memory_id`.
+- `memory_update(memory_id, ...)` — partial updates incl. `status`, `trust_delta`.
+- `memory_get_source(source_ref)` — returns raw content + excerpt + optional expansion.
+- `memory_recent_context(project?, max_chars?)` — compact working set for session start.
+- `memory_dream_now(scope?, project?, deep?)` — manual dreamer trigger.
+
+`fact_feedback` (helpful / unhelpful) is preserved from holographic as a sibling tool — small, cheap, real trust-training value.
+
+### FR-013: Built-in Hermes Memory Sync
+
+`MEMORY.md` and `USER.md` continue to be maintained by Hermes built-ins. The plugin's `on_memory_write` hook mirrors those writes as facts (category `user_pref` or `general`). The plugin does NOT take ownership of these files.
+
+### FR-014: Local-Only Default
+
+No external API calls by default. All memory content stays local.
+
+### FR-015: Redaction Guard (Phase 1, not Phase 9)
+
+Before any disk write, content passes through a regex + entropy scan for: AWS keys, GitHub tokens, OpenAI/Anthropic API keys (`sk-...`), generic high-entropy `[A-Z0-9]{32,}` patterns, private keys (`-----BEGIN`), credit-card-like strings (Luhn check), SSN patterns. Detected matches are replaced inline with `[REDACTED:<type>]`. Redaction events are logged with `event_id` and pattern type but never the raw value. User can override per-fact via `force_no_redact: true` flag on `memory_write` (logged separately for audit).
+
+### FR-016: Backup and Portability
+
+`memory backup` creates a timestamped archive of raw JSONL + QMD files + SQLite DB + project files + dream reports + config. Qdrant snapshot fired via Qdrant API.
+
+### FR-017: Source Resolver
+
+`memory_get_source(source_ref)` resolves these ref formats:
+
+- `session:{session_id}#turn={turn_id}`
+- `session:{session_id}#turns={start}-{end}`
+- `session:{session_id}#turn={turn_id}#tool={tool_call_id}`  *(new — was missing in v0.1)*
+- `daily:{YYYY-MM-DD}`
+- `project:{project}/memory.md#section={heading}`
+- `fact:{fact_id}`
+- `decision:{decision_id}`
+- `question:{question_id}`
+- `dream:{dream_run_id}`
+
+### FR-018: Recent Context
+
+`memory_recent_context` returns pinned user facts + active project facts + recent decisions + open questions + recent session/dream summaries, ALL within a configurable `max_chars` budget (default 4000), all source-traced.
+
+### FR-019: Narrative Thread (with `/new` fix)
+
+Per-session `~/.hermes/SESSION-THREAD/{session_id}.md` with rolling 5-exchange window, focus line, tools-used list.
+
+**Critical change from v0.1 / holographic:** on `/new`, `/resume`, `/branch`, and post-context-compression, prior session content is injected as a **`{"role": "user", ...}` message** prepended to `conversation_history` — NOT as a `system_prompt_block()` addition. This bypasses the cached-system-prompt limitation in Hermes core (`_cached_system_prompt` is set once at agent init and only invalidated during compression). A short prompt directive ("Briefly note what you found above from the last session and ask if there's anything to continue") is included in the injected user message.
+
+### FR-020: Provider Swap & Migration
+
+- Activated via `memory.provider: hermes-local` in `~/.hermes/config.yaml`.
+- Hermes' single-provider rule guarantees the previous provider's tools (e.g., `fact_store`) are no longer registered.
+- A one-shot migration script reads holographic facts from `~/.hermes/memory_store.db` and writes them through `memory_write` into the new store. Run via `memory migrate-from-holographic`. Idempotent — safe to re-run; uses content-hash dedup.
+- Holographic data is never modified or deleted.
+
+---
+
+## 9. Non-Functional Requirements
+
+| ID | Requirement |
 |---|---|
-| Raw JSONL | Immutable lossless source of truth |
-| QMD/Markdown sessions | Human-readable source view |
-| SQLite | Canonical structured ledger for sessions, turns, facts, decisions, questions, and dream runs |
-| SQLite FTS5 | Exact keyword / BM25-style retrieval |
-| Qdrant | Semantic vector retrieval |
-| Daily files | Derived day-level memory |
-| Project memory files | Derived project-level memory |
-| Mem0 OSS | Optional adaptive memory mirror |
-| Graph store | Optional relationship/time-evolution view |
+| NFR-001 | All memory content stays local by default. |
+| NFR-002 | Every derived item traces to raw source via `source_ref`. |
+| NFR-003 | Raw is append-only; failed dream/index jobs are retryable. |
+| NFR-004 | Latency: keyword < 1s, semantic < 2s, hybrid < 4s. Dreamer batch-oriented. |
+| NFR-005 | Idempotency: capture / indexing / dreaming safe to re-run. |
+| NFR-006 | Extensible: future agents, transcripts, graphs without re-architecting. |
+| NFR-007 | Local LLM compat: works with LM Studio / Ollama / llama.cpp OpenAI-compat. |
+| NFR-008 | All memory files human-readable and human-editable. |
+| NFR-009 | Secrets blocked by Phase 1 redaction; override is auditable. |
+| NFR-010 | Answers cite source refs. |
+| NFR-011 | **Schema independence** — zero direct queries into `hermes_state.db` or `memory_store.db` schemas. |
+| NFR-012 | **Graceful degradation** — system functions if Qdrant, LMS embeddings, or dreamer LLM are down (hybrid weights redistribute; reads still work; writes queue for later index). |
+| NFR-013 | **Concurrent safety** — plugin (in-process writes) and gateway (out-of-process reads / cron writes) coordinate via SQLite WAL + write-queue. |
 
-Hermes shall not need to know which backend produced a result. The Local Memory Gateway shall return a normalized result set.
+---
 
-### 4A.4 Central Query Behavior
+## 10. Normalized Result Shape
 
-When Hermes calls `memory_query`, the gateway shall:
-
-1. Parse intent, scope, project, memory types, filters, and search mode.
-2. Query applicable backends in parallel or sequence.
-3. Search structured facts, decisions, and open questions.
-4. Search SQLite FTS5 for exact keyword matches.
-5. Search Qdrant for semantic matches.
-6. Search project/daily/session memory files when applicable.
-7. Optionally query Mem0 OSS or graph memory if enabled.
-8. Merge and deduplicate results by `source_ref`, `memory_id`, and content hash.
-9. Rerank results based on mode, relevance, source type, recency, project match, and confidence.
-10. Return one normalized, source-backed result set.
-
-### 4A.5 Central Write Behavior
-
-When Hermes or the dreamer calls `memory_write`, the gateway shall:
-
-1. Validate the memory write request.
-2. Require source references unless explicitly marked as user-pinned manual memory.
-3. Run redaction and safety checks.
-4. Check for duplicates, contradictions, and superseded facts.
-5. Write the canonical record to SQLite.
-6. Append/update human-readable memory files.
-7. Update SQLite FTS indexes.
-8. Generate embeddings and update Qdrant.
-9. Optionally mirror to Mem0 OSS.
-10. Optionally update graph memory.
-11. Return a canonical `memory_id` and `source_ref`.
-
-### 4A.6 Required Normalized Result Shape
-
-All memory read tools shall return results using a normalized shape:
+Every read tool returns:
 
 ```json
 {
@@ -196,14 +365,15 @@ All memory read tools shall return results using a normalized shape:
     {
       "memory_id": "decision_20260517_000001",
       "type": "decision",
-      "project": "hermes",
-      "text": "Use a local central memory gateway as the single memory interface.",
+      "project": "hermes-memory",
+      "text": "Build as new MemoryProvider plugin alongside holographic.",
       "score": 0.94,
-      "confidence": 0.97,
+      "confidence": 0.95,
       "source_ref": "session:sess_20260517_hermes_001#turns=4-9",
       "backend_hits": ["sqlite_decisions", "qdrant", "fts"],
       "created_at": "2026-05-17T12:00:00-05:00",
-      "updated_at": "2026-05-17T12:30:00-05:00"
+      "updated_at": "2026-05-17T12:30:00-05:00",
+      "metadata": {}
     }
   ],
   "sources": [
@@ -216,819 +386,156 @@ All memory read tools shall return results using a normalized shape:
 }
 ```
 
-### 4A.7 Central Gateway Acceptance Requirement
+---
 
-The system is not considered MVP-complete unless Hermes can retrieve facts, decisions, raw turns, daily memory, project memory, semantic results, and exact keyword results through the same central `memory_query` function.
+## 11. Search Behavior
 
+### 11.1 Keyword-first cases
+Exact error strings, config keys, code, filenames, command snippets, product/model names, dates, URLs.
 
-## 5. Personas
+### 11.2 Semantic-first cases
+Conceptual questions, "what did we decide about...", "summarize what we discussed about...", "find chats related to...".
 
-### 5.1 Primary Persona: Local AI Power User / Builder
+### 11.3 Hybrid ranking factors
+Semantic score, keyword score, Jaccard token overlap, HRR similarity, recency, project match, source type, fact/decision priority, user-pinned status, contradiction/supersession status.
 
-The primary user is building a self-hosted AI lab and wants advanced agentic workflows across Hermes, OpenClaw, Agent Zero, local models, NAS storage, meeting transcripts, documents, coding workflows, and presentations.
-
-Needs:
-
-- Local-first control
-- High recall quality
-- Durable long-term context
-- Practical technical implementation
-- Auditable source-of-truth files
-- Flexible integration with agents and tools
-
-### 5.2 Secondary Persona: Agent Runtime
-
-Hermes is a consumer of the memory system.
-
-Needs:
-
-- Fast recall APIs
-- Structured query results
-- Concise context injection
-- Write/update tools
-- Fact and decision lookup
-- Session/project filtering
-- Safe memory mutation rules
-
-### 5.3 Secondary Persona: Maintenance/Dreaming Job
-
-The dreamer is an automated local process.
-
-Needs:
-
-- Access to raw unprocessed turns
-- Idempotent processing
-- Checkpointing
-- Conflict detection
-- Ability to write summaries and facts
-- Ability to update indexes
-- Ability to generate a dream report
+### 11.4 Degradation
+- Qdrant down → semantic weight → 0, redistributed to FTS+Jaccard.
+- LMS embeddings down → same.
+- numpy missing → HRR weight → 0, redistributed.
+- All four backends down → return error with `degraded_modes: [...]`.
 
 ---
 
-## 6. Scope
+## 12. Dreaming Behavior
 
-### 6.1 MVP Scope
+### 12.1 Cadence
+- Nightly cron at 3am (workhorse)
+- Manual: `memory_dream_now`
+- Session-end (optional flag)
+- Weekly deep dream (cross-week consolidation)
 
-The MVP includes:
+### 12.2 Output
+- One file per run: `memory/dreams/YYYY-MM-DD-HHMM.md`
+- Updated daily / project memory files
+- New rows in `facts`, `decisions`, `open_questions`, `dream_runs`
 
-1. Local directory structure for lossless memory.
-2. JSONL append-only session archive.
-3. QMD/Markdown session export.
-4. SQLite database with:
-   - sessions
-   - turns
-   - chunks
-   - facts
-   - decisions
-   - open questions
-   - dream runs
-   - source references
-5. SQLite FTS5 index for keyword search.
-6. Qdrant collection for semantic search.
-7. Local embedding pipeline.
-8. Local summarization/dreaming pipeline.
-9. Memory CLI.
-10. Hermes-facing memory tools:
-   - semantic search
-   - keyword search
-   - hybrid search
-   - get session
-   - get daily memory
-   - get project memory
-   - add fact
-   - add decision
-   - dream now
-11. Human-readable memory files:
-   - `MEMORY.md`
-   - `USER.md`
-   - daily files
-   - project memory files
-   - facts
-   - decisions
-   - open questions
-12. Docker Compose for local services.
+### 12.3 Contradiction Handling (heuristic v1)
+- Group candidate facts by `(project, entity, category)`.
+- If a candidate matches an existing fact's bucket but contradicts on key tokens, do NOT overwrite — write the new fact with `status='disputed'` and `supersedes_fact_id` populated; emit a dream-report warning.
+- LLM-based semantic contradiction detection deferred to post-MVP.
 
-### 6.2 Post-MVP Scope
+### 12.4 Promotion Levels
+1. raw → 2. indexed → 3. summarized → 4. candidate fact → 5. durable fact → 6. pinned memory.
 
-1. Mem0 OSS integration as optional local memory API.
-2. Graph memory with Neo4j, Kùzu, or Graphiti-style extraction.
-3. UI dashboard.
-4. Cross-agent memory bus for Hermes, OpenClaw, and Agent Zero.
-5. Document/file ingestion beyond chat turns.
-6. Meeting transcript ingestion.
-7. Relationship/time-evolution queries.
-8. Memory governance workflows.
-9. Local re-ranker.
-10. Redaction pipeline.
+Default auto-promote threshold: 0.8 confidence. Below threshold: candidate, requires manual review (CLI in MVP, dashboard post-MVP).
 
 ---
 
-## 7. Functional Requirements
+## 13. Integration
 
-### FR-001: Lossless Chat Capture
+### 13.1 Hermes Plugin
+- Registered via `plugins/memory/hermes-local/plugin.yaml` + `register(ctx)`.
+- Activated by `memory.provider: hermes-local` in config.
+- Plugin config block under `plugins.hermes-local-memory:` in `config.yaml`.
 
-The system shall capture every user, assistant, system, and tool turn from Hermes sessions into append-only JSONL files.
+### 13.2 FastAPI Gateway
+- Default port: `8787`.
+- Started by systemd unit or `memory serve` CLI.
+- All endpoints documented in TDD §5.
 
-Each captured event shall include:
+### 13.3 Qdrant
+- URL: `http://localhost:6333` (already running).
+- Collections versioned: `hermes_memory_<type>_<embed_model>_<embed_version>`.
 
-- `session_id`
-- `turn_id`
-- `timestamp`
-- `role`
-- `content`
-- `agent`
-- `project`
-- `source`
-- `tags`
-- `tool_calls`
-- `attachments`
-- `metadata`
-- `hash`
-- `parent_turn_id`
-- `embedding_status`
-- `index_status`
-- `dream_status`
+### 13.4 LM Studio
+- Embeddings: `http://192.168.2.105:1235` → `text-embedding-nomic-embed-text-v1.5@f16` (768d).
+- Dreamer LLM: `http://192.168.2.105:1234` → Qwen3.6-35B.
 
-Acceptance baseline: no conversation content is lost during normal operation.
+### 13.5 SQLite
+- File: `~/.hermes/memory/memory.sqlite`.
+- WAL mode with NFS/SMB/FUSE fallback (reuse `hermes_state.apply_wal_with_fallback`).
+- Single writer per process; plugin and gateway coordinate via in-DB advisory locks for dreamer batch writes.
 
 ---
 
-### FR-002: Human-Readable Session Export
-
-The system shall export each session to QMD or Markdown.
-
-The export shall include:
-
-- session metadata
-- chronological turns
-- tool call summaries
-- source links
-- tags
-- extracted headings
-- optional generated session summary
-
----
-
-### FR-003: Daily Memory Files
-
-The system shall maintain one daily memory file per date.
-
-Daily files shall include:
-
-- sessions processed
-- major topics
-- durable facts discovered
-- decisions made
-- unresolved questions
-- follow-up actions
-- changed project memories
-- source references
-
----
-
-### FR-004: Project Memory Files
-
-The system shall maintain project-specific memory folders.
-
-Example:
-
-```text
-/memory/projects/hermes/
-  memory.md
-  facts.md
-  decisions.md
-  open_questions.md
-  timeline.md
-  sources.md
-```
-
-The system shall support projects such as:
-
-- `hermes`
-- `openclaw`
-- `agent-zero`
-- `local-ai-lab`
-- `meeting-intelligence`
-- `diveratings`
-- `work-aem`
-- `personal-ai`
-
----
-
-### FR-005: Fact Store
-
-The system shall extract durable facts into a structured local database and Markdown files.
-
-Each fact shall include:
-
-- fact text
-- confidence
-- scope
-- project
-- source session
-- source turn IDs
-- first seen date
-- last confirmed date
-- status: active, superseded, disputed, archived
-- supersedes/superseded_by relationship
-- tags
-
----
-
-### FR-006: Decision Store
-
-The system shall extract decisions into a structured store.
-
-Each decision shall include:
-
-- decision text
-- rationale
-- project
-- date
-- source references
-- owner
-- status
-- downstream implications
-- related facts
-
----
-
-### FR-007: Open Questions Store
-
-The system shall extract unresolved questions.
-
-Each open question shall include:
-
-- question
-- project
-- priority
-- source references
-- created date
-- status
-- next action
-
----
-
-### FR-008: Semantic Search
-
-The system shall support semantic search over:
-
-- raw turns
-- chunks
-- session summaries
-- daily summaries
-- project memory files
-- facts
-- decisions
-- open questions
-
-The semantic search engine shall support metadata filtering by:
-
-- project
-- date range
-- session
-- role
-- source
-- tag
-- memory type
-
-Qdrant is the preferred vector store. Qdrant collections contain points with vectors and JSON payloads, and Qdrant supports payload-based filtering for precise retrieval.
-
----
-
-### FR-009: Keyword Search
-
-The system shall support exact keyword search over all captured text.
-
-SQLite FTS5 or Postgres full-text search shall be used.
-
-Keyword search must handle exact strings such as:
-
-- config keys
-- error messages
-- model names
-- hardware names
-- filenames
-- commands
-- URLs
-- code snippets
-
----
-
-### FR-010: Hybrid Search
-
-The system shall provide a hybrid search API that combines:
-
-- vector semantic results
-- keyword/FTS results
-- metadata filters
-- recency boost
-- source-type boost
-- optional reranking
-
-Hybrid results shall include source references and enough excerpt context to allow Hermes to answer accurately.
-
----
-
-### FR-011: Dreaming / Recursive Consolidation
-
-The system shall include a local scheduled dreamer.
-
-The dreamer shall:
-
-1. Read new raw turns since the last dream checkpoint.
-2. Group content by session, day, project, topic, and entity.
-3. Generate session summaries.
-4. Generate or update daily summaries.
-5. Extract durable facts.
-6. Extract decisions.
-7. Extract unresolved questions.
-8. Detect contradictions or superseded facts.
-9. Update project memory files.
-10. Update semantic and keyword indexes.
-11. Produce a dream report.
-
-The dreamer shall never overwrite raw history.
-
----
-
-### FR-012: Hermes Tool Interface
-
-The system shall expose tools for Hermes:
-
-- `memory_search_semantic`
-- `memory_search_keyword`
-- `memory_search_hybrid`
-- `memory_get_session`
-- `memory_get_daily`
-- `memory_get_project`
-- `memory_add_fact`
-- `memory_add_decision`
-- `memory_add_open_question`
-- `memory_update_fact`
-- `memory_dream_now`
-- `memory_recent_context`
-- `memory_trace_sources`
-
-Tools shall return concise, source-referenced results.
-
----
-
-### FR-013: Built-in Hermes Memory Sync
-
-The system shall maintain Hermes built-in memory files as curated top-level summaries.
-
-Files:
-
-- `MEMORY.md`
-- `USER.md`
-
-These files shall be small enough to remain useful in agent context.
-
----
-
-### FR-014: Local-Only Default
-
-The system shall run locally by default.
-
-No captured memory content shall be sent to external services unless explicitly configured.
-
----
-
-### FR-015: Backup and Portability
-
-The system shall support backup by copying the memory directory and database files.
-
-The source-of-truth archive shall remain portable because it uses:
-
-- JSONL
-- Markdown/QMD
-- SQLite
-- Qdrant export/snapshot
-
----
-
----
-
-### FR-016: Central Memory Gateway
-
-The system shall expose a single Local Memory Gateway as the only supported programmatic memory interface for Hermes and other agents.
-
-Hermes shall not directly query backend memory stores. All read/write/search/update/dream/reindex operations shall route through the Local Memory Gateway.
-
-The gateway shall support:
-
-- `memory_query`
-- `memory_write`
-- `memory_get_source`
-- `memory_recent_context`
-- `memory_dream`
-- `memory_reindex`
-- `memory_update`
-
-Acceptance baseline: one call to `memory_query` can retrieve and merge results from structured facts, decisions, raw historical turns, QMD session files, daily files, project files, FTS keyword search, Qdrant semantic search, and any enabled optional memory backends.
-
----
-
-### FR-017: Memory Orchestrator
-
-The system shall include a Memory Orchestrator inside the Local Memory Gateway.
-
-The orchestrator shall:
-
-- route queries to relevant backends
-- merge results
-- deduplicate results
-- normalize result shape
-- rank results
-- enforce source traceability
-- enforce redaction and write rules
-- update all derived indexes after canonical writes
-- hide backend complexity from Hermes
-
-Acceptance baseline: Hermes receives one normalized result set regardless of which backend produced the underlying memory hits.
-
----
-
-### FR-018: Canonical Write Path
-
-The system shall enforce a single canonical write path for durable memory writes.
-
-All facts, decisions, open questions, project memory updates, daily memory updates, and dream outputs shall be written through `memory_write` or an internal gateway-equivalent write service.
-
-The write path shall update:
-
-- SQLite canonical structured ledger
-- Markdown/QMD memory files where applicable
-- SQLite FTS indexes
-- Qdrant semantic indexes
-- optional Mem0 OSS mirror
-- optional graph memory
-
-Acceptance baseline: no component writes durable memory to only one backend without updating the canonical ledger and indexes.
-
----
-
-### FR-019: Source Resolver
-
-The system shall provide `memory_get_source` as a central source resolver.
-
-The source resolver shall retrieve original raw source content from:
-
-- raw JSONL sessions
-- QMD/Markdown session files
-- daily files
-- project files
-- facts
-- decisions
-- open questions
-- dream reports
-
-Acceptance baseline: every returned memory result can be traced to an original source or explicitly marked as manually pinned memory.
-
----
-
-### FR-020: Central Recent Context
-
-The system shall provide `memory_recent_context`.
-
-This tool shall return compact, token-budget-aware context for Hermes at session start or project switch.
-
-The context may include:
-
-- pinned user facts
-- active project facts
-- recent decisions
-- unresolved open questions
-- recent relevant sessions
-- recent dream summaries
-- high-priority contradictions or review items
-
-Acceptance baseline: Hermes can obtain a compact working set without directly reading individual memory files.
-
-
-## 8. Non-Functional Requirements
-
-### NFR-001: Privacy
-
-All memory content shall remain local by default.
-
-### NFR-002: Auditability
-
-Every derived memory item shall trace back to raw source turns.
-
-### NFR-003: Recoverability
-
-Raw history shall be append-only. Failed dream/index jobs shall be retryable.
-
-### NFR-004: Performance
-
-Target local response times:
-
-- keyword search: under 1 second for normal use
-- semantic search: under 2 seconds for normal use
-- hybrid search: under 4 seconds for normal use
-- dream run: batch-oriented, no strict interactive SLA
-
-### NFR-005: Idempotency
-
-Running indexing or dreaming repeatedly shall not create duplicate facts, duplicate chunks, or duplicate vector points.
-
-### NFR-006: Extensibility
-
-The system shall allow additional agents, tools, documents, transcripts, and graph memory later.
-
-### NFR-007: Local Model Compatibility
-
-The system shall support local LLMs and local embedding models served through LM Studio, Ollama, or equivalent local endpoints.
-
-### NFR-008: Human Editability
-
-Memory files shall be human-readable and manually editable.
-
-### NFR-009: Security
-
-The system shall exclude secrets from memory by default and support redaction rules.
-
-### NFR-010: Explainability
-
-Answers using memory shall include source references when possible.
-
----
-
-## 9. Data Types
-
-### 9.1 Raw Turn
-
-A raw turn is an immutable source event.
-
-### 9.2 Chunk
-
-A chunk is a retrieval unit derived from one or more turns.
-
-### 9.3 Summary
-
-A summary is a derived compression of a session, day, or project.
-
-### 9.4 Fact
-
-A fact is a durable statement believed to be useful across future sessions.
-
-### 9.5 Decision
-
-A decision is a committed choice, plan, architecture preference, or constraint.
-
-### 9.6 Open Question
-
-An open question is an unresolved item requiring future attention.
-
-### 9.7 Memory File
-
-A memory file is a Markdown/QMD artifact that can be read directly by humans or agents.
-
----
-
-## 10. Memory Taxonomy
-
-### 10.1 User Memory
-
-Long-lived facts about the user’s goals, preferences, environment, and constraints.
-
-Examples:
-
-- local-first preference
-- no recurring token-metered memory provider
-- AI lab hardware
-- OpenClaw/Hermes/Agent Zero project focus
-
-### 10.2 Project Memory
-
-Durable facts and decisions specific to a project.
-
-Examples:
-
-- Hermes memory architecture
-- OpenClaw configuration decisions
-- meeting transcript RAG pipeline
-- Diveratings site planning
-
-### 10.3 Session Memory
-
-Summary and important items from a conversation session.
-
-### 10.4 Daily Memory
-
-Cross-session summary of a day.
-
-### 10.5 Entity Memory
-
-Facts about entities such as systems, tools, vendors, models, hardware, or people.
-
-### 10.6 Operational Memory
-
-Commands, errors, configs, file paths, architecture decisions, and troubleshooting context.
-
----
-
-## 11. Search Behavior Requirements
-
-### 11.1 Keyword First Cases
-
-Keyword search shall be preferred or blended heavily for:
-
-- exact error strings
-- config keys
-- code
-- filenames
-- command-line snippets
-- product/model names
-- dates
-- URLs
-
-### 11.2 Semantic First Cases
-
-Semantic search shall be preferred or blended heavily for:
-
-- conceptual questions
-- “what did we decide about...”
-- “summarize what we discussed about...”
-- “what was the rationale for...”
-- “find chats related to...”
-
-### 11.3 Hybrid Ranking
-
-Hybrid ranking shall consider:
-
-- semantic score
-- keyword score
-- recency
-- project match
-- source type
-- fact/decision priority
-- user-pinned memory
-- contradiction/supersession status
-
----
-
-## 12. Dreaming Behavior Requirements
-
-### 12.1 Dream Cadence
-
-Supported modes:
-
-- manual `dream now`
-- nightly scheduled job
-- session-end dream
-- weekly deep dream
-
-### 12.2 Dream Outputs
-
-Each dream run shall produce:
-
-```text
-/memory/dreams/YYYY-MM-DD-HHMM.md
-```
-
-With:
-
-- input sessions
-- extracted facts
-- decisions
-- open questions
-- contradictions
-- project updates
-- index status
-- errors/warnings
-
-### 12.3 Contradiction Handling
-
-If a new fact conflicts with an existing fact:
-
-- do not silently overwrite
-- mark as disputed or superseded
-- include source references
-- optionally ask user for confirmation if high impact
-
-### 12.4 Memory Promotion
-
-Raw turns become durable memory only after extraction and scoring.
-
-Promotion levels:
-
-1. raw
-2. indexed
-3. summarized
-4. candidate fact
-5. durable fact
-6. pinned memory
-
----
-
-## 13. Integration Requirements
-
-### 13.1 Hermes Integration
-
-The system shall provide an HTTP, CLI, or MCP interface callable by Hermes.
-
-### 13.2 Mem0 OSS Integration
-
-Mem0 OSS may be integrated as an optional local memory API, not the sole source of truth.
-
-Mem0 OSS supports self-hosted use and can run as a library or server with dashboard/API keys/audit logging.
-
-### 13.3 Qdrant Integration
-
-Qdrant shall store vector embeddings and payload metadata for retrieval.
-
-### 13.4 SQLite/Postgres Integration
-
-SQLite is preferred for MVP simplicity. Postgres may be used later if multi-user or higher-concurrency requirements grow.
-
-SQLite is small, self-contained, reliable, and broadly embedded; SQLite FTS5 supports efficient keyword search across large text collections.
-
-### 13.5 Local Model Integration
-
-The system shall support:
-
-- local embeddings
-- local summarization
-- local fact extraction
-- local contradiction detection
-
-Model serving options:
-
-- LM Studio
-- Ollama
-- llama.cpp server
-- vLLM, if appropriate later
-
----
-
-## 14. Risks and Mitigations
-
-| Risk | Impact | Mitigation |
-|---|---:|---|
-| Fact extraction stores incorrect facts | High | Store confidence, source references, and allow review |
-| Vector search misses exact terms | Medium | Maintain keyword FTS index |
-| Keyword search misses conceptual matches | Medium | Maintain Qdrant semantic index |
-| Dreamer overwrites good memory | High | Raw history append-only; derived memory versioned |
-| Large memory grows slow | Medium | Chunking, indexes, snapshots, archival policies |
-| Secrets accidentally stored | High | Redaction filters and secret scanning |
-| Local model quality insufficient | Medium | Use stronger local model for dreamer; allow manual review |
-| Integration with Hermes changes | Medium | Keep adapter layer isolated |
-| Mem0 OSS changes API | Low/Medium | Keep source-of-truth outside Mem0 |
+## 14. Risks & Mitigations
+
+(Full register in `PROJECT.md §8`. Highlights below.)
+
+| Risk | Severity | Mitigation |
+|---|---|---|
+| Hermes upstream schema changes | High | Own our SQLite file. Touch Hermes only via public ABCs/helpers. |
+| Embedding model swap | Medium | Collection naming includes model version. Rebuild from raw on swap. |
+| Narrative thread injection still broken | Medium | Use user-message injection (not system-prompt). Integration test covers /new. |
+| Dreamer hallucination | High | Source refs required. Confidence threshold. Disputed status, not silent overwrite. |
+| Secrets leak | High | Redaction in Phase 1 with fixture tests. |
+| Concurrent writes | Low/Med | WAL + single-writer + advisory locks. |
+| Disk growth | Medium | Backup policy + post-MVP compression. |
 
 ---
 
 ## 15. Success Metrics
 
-### 15.1 MVP Metrics
-
+### 15.1 MVP Acceptance
 - 100% of new Hermes sessions captured to JSONL.
-- 100% of captured sessions exported to QMD/Markdown.
-- Keyword search finds exact strings from prior sessions.
-- Semantic search finds conceptually related sessions.
-- Dreamer produces daily and project summaries.
-- Durable facts include source references.
-- Hermes can query memory through local tools.
+- 100% exported to QMD/Markdown.
+- Keyword search finds fixture exact strings.
+- Semantic search finds fixture conceptual matches.
+- Hybrid search merges + deduplicates.
+- Dreamer produces daily + project memory files with source refs.
+- Hermes calls memory through new tools only — `fact_store` no longer in toolset.
+- After `/new`, assistant references prior session focus in first reply.
+- Migration from holographic completes with zero data loss.
+- All indexes rebuildable from raw JSONL.
 
-### 15.2 Quality Metrics
-
-- Recall precision for project questions is acceptable to user.
-- False durable memory writes are visible and correctable.
-- Fact contradictions are surfaced, not hidden.
-- User can trace answers back to source sessions.
-- System can be backed up/restored from local files.
+### 15.2 Quality
+- User-perceived recall precision acceptable on real workflow queries.
+- Memory writes are visible and correctable.
+- Contradictions surfaced, not hidden.
+- Every answer source-citable.
 
 ---
 
 ## 16. MVP Release Criteria
 
-The MVP is releasable when:
+The MVP ships when:
 
-1. Hermes conversation turns are captured losslessly.
-2. Raw JSONL and QMD files are generated.
-3. SQLite schema is created and populated.
-4. FTS search works.
-5. Qdrant search works.
+1. Lossless capture verified.
+2. Raw JSONL + QMD generated.
+3. Schema in place + populated.
+4. FTS5 keyword search works.
+5. Qdrant semantic search works.
 6. Hybrid search works.
-7. Dreamer generates daily/project memory files.
-8. Hermes can call memory tools.
-9. All derived memory items trace to source turns.
-10. Backup/restore instructions exist.
-11. Hermes can retrieve all memory types through the central `memory_query` function.
-12. Hermes does not need direct access to Qdrant, SQLite, raw JSONL, QMD, daily files, project files, or Mem0.
+7. Dreamer generates daily / project memory.
+8. Plugin tools available; `fact_store` confirmed absent.
+9. Every derived memory traces to source.
+10. `/new` narrative thread injection works (acceptance test).
+11. Redaction tested against fixture secrets.
+12. Backup + rebuild documented and tested.
+13. Migration from holographic complete + reversible (provider config flip).
+14. All MVP acceptance scenarios in `Plan.md §13` pass.
 
 ---
 
-## 17. References
+## 17. Open Questions for Sign-Off
 
-- Hermes Agent memory providers: https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/memory-providers.md
-- Hermes Honcho memory overview: https://hermes-agent.nousresearch.com/docs/user-guide/features/honcho
-- Mem0 OSS overview: https://docs.mem0.ai/open-source/overview
-- Mem0 self-hosted setup: https://docs.mem0.ai/open-source/setup
-- Qdrant collections: https://qdrant.tech/documentation/manage-data/collections/
-- Qdrant payload filtering: https://qdrant.tech/documentation/search/filtering/
-- Qdrant payload indexing: https://qdrant.tech/documentation/manage-data/payload/
-- SQLite: https://sqlite.org/
+| ID | Question | Recommendation |
+|---|---|---|
+| Q1 | Final plugin name? | `hermes-local` (short config key: `memory.provider: hermes-local`). Alt: `hermes-local-memory`. |
+| Q2 | Gateway lifecycle? | systemd unit + `memory serve`; auto-start with Hermes. |
+| Q3 | Plugin-only mode (no gateway)? | Yes — plugin can call `memory_core` directly for all reads. Gateway is required only for cross-process access (cron dreamer, future OpenClaw). |
+| Q4 | Session-end dreaming? | Off by default; enable per user preference. Cron at 3am is the workhorse. |
+| Q5 | Narrative-thread retention window? | 30 days of per-session files; dreamer rolls older ones into daily/project memory. |
+
+---
+
+## 18. References
+
+- `~/.hermes/PROJECTS/hermes-memory/Memory_References.md`
+- Existing plugin code:
+  - `~/.hermes/hermes-agent/agent/memory_provider.py` (ABC)
+  - `~/.hermes/hermes-agent/plugins/memory/holographic/` (primary reference)
+  - `~/.hermes/hermes-agent/plugins/memory/honcho/` (out-of-process reference)
+- OpenClaw enhanced-memory: `~/.openclaw/workspace/skills/enhanced-memory/README.md`
+- v0.1 docs: `docs/archive/v0.1-original/`

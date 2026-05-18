@@ -7,9 +7,12 @@
 
 ## Current State
 
-**Phase:** Phase 1 — AUDIT_PENDING (substance complete, gate closing in progress)
-**Phase gate:** t_a2b7d19d — T-PHASE1-GATE (ready, awaiting AUDIT-GATE pass + orchestrator transition)
-**hm-auditor:** Active — audit/PHASE_1_GATE_AUDIT.md written, 18-point audit complete (15/18 pass, 3 require action)
+**Phase:** Phase 3 — PLANNING (orchestrator: PHASE_3_PLANNING, STATE.md updated)
+**Phases done:** [1, 2]
+**Phase 1 gate:** t_a2b7d19d — PASS (18/18 criteria, 231 tests)
+**Phase 2 gate:** t_1594570f — PASS (4/4 QA cards, 597 tests)
+**Phase 3 planning:** T-011 decomposition running
+**hm-auditor:** Active — auto_completed behavior confirmed (clean-exit workers auto-marked done)
 
 **Audit status:** 15/18 criteria pass. 3 require action before gate can close:
 - Criterion 3: Fresh gate card created (t_a2b7d19d)

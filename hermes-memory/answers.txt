@@ -1,0 +1,43 @@
+These are the calls I'd want from you before writing a line of code:
+
+1. **The big one — relationship to `hermes_state.py` / `memory_store.db`.** Are you OK with me extending the existing Hermes session DB rather than building a parallel one? (Critique's Issue 1.) Strongly recommend yes.
+
+Answer:  Yes, however the one thing that i would be concerned about is any issues with upgrades impacting the schema over time.  Since this is a base system table, we dont own this, and we dont know or can control what Hermes team might do in the future.
+
+2. **Project home.** `~/.hermes/memory/` (everything together, what your memory file already says) vs `~/.hermes-memory/` (sibling) vs the original `~/ai-memory/hermes-local-memory/` (totally separate). I'd vote `~/.hermes/memory/`.
+
+Answer: We would keep documentation in the PROJECTS folder under the hermes-memory folder, however, other code, script or repositories can/should live in the most appropriate structures already provided by whatever the current hermes folder hierarchies dictate, so that its more logical and grouped.
+
+3. **Plugin vs standalone service for capture.** OK with the split — Hermes plugin for write path, standalone FastAPI/MCP for read+dream? Or do you want everything in one service that Hermes calls over HTTP?
+
+Answer:I think if there is a benefit of using the plugin architecture, then we would center around that, otherwise if there isnt and HTTP API allows for more flexibility, then we would gravitate towards that.
+
+4. **Replace Honcho/cloud providers, or live alongside them?** Hermes enforces "one external MemoryProvider at a time." If we build this as the provider, it replaces any cloud option. Fine?
+
+Answer: Yes, its ok to replace, as at this time we use Holographic, so as long as there is no loss when switching over, its fine.
+
+5. **Dreamer LLM.** Spark Nemotron 120B (`.249`) for deep dreaming, smaller Qwen on `.105` for fast chunk labeling? Or all-Spark? Also: dream cadence — nightly cron, session-end, manual, or all three?
+
+Answer: Nemotron, in my experience has been very slow performance, and I have been generally impressed with Qwen3.6-35b's intellect and speed, so i think it could be used for both really.  Dreaming in openclaw occurs nightly at 3am, so good with a daily off peak cron.
+
+6. **`fact_store` future.** Absorb it (gateway becomes the only fact API), shim it (keep the tool, redirect writes through the gateway), or leave it alone (parallel system)? My vote: shim it for v1, absorb later.
+
+Answer: Its a good question, it would be nice to consolidate, however my experience has been, even with my openclaw, when we gave him enhanced_search (and put that in his soul.md), he tended to try to use default memory_search built in function.  If we can consolidate and ensure usage, the thats best.
+
+7. **Cross-agent scope for MVP.** Build the gateway with OpenClaw/Agent Zero in mind from day one (more abstract API surface), or Hermes-only and generalize after it's proven? Vote: Hermes-only first.
+
+Answer: Think we are just fine with this being standalone for Hermes, since Openclaw's is already in place, and not really a near term need for share.
+
+8. **Plan.md as-is vs my recut.** Want me to take a pass at a revised `Plan.md` with the consolidated MVP scope above, or keep the existing plan and just track changes against it?
+
+Answer: Yep, we need a redo on all the the docs, that true up to this recommended approach, architecture and phasing execution.
+
+9. **Project tracking.** This sits in `~/.hermes/PROJECTS/hermes-memory/` so it's outside the OpenClaw workspace git. Do you want me to spin up a real repo for it (`~/.hermes/PROJECTS/hermes-memory/` as a git repo of its own), or develop inside the hermes-agent tree as a plugin from the start?
+
+Answer: That is correct, PROJECTS is the project management home for projects (read the readme.md, and scaffold as necessary). I think this is already in github hermes-agent repo, and probably ok to leave as that without another repo.
+
+10. **Reuse OpenClaw enhanced-memory code?** Their `hybrid_search.py` is already battle-tested. Lift it as the v1 retrieval backbone, or write fresh?
+
+Answer: Anything in the existing memory framework code that is useful, can be used as point of reference and lifted where it can be then adjusted.
+
+Pick the ones you have opinions on and I'll lock the design before we move to writing/updating docs or breaking ground.

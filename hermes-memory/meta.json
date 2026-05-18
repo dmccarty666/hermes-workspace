@@ -1,0 +1,65 @@
+{
+  "project_key": "hermes-memory",
+  "name": "Hermes Local Memory",
+  "owner": "David McCarty",
+  "status": "active",
+  "created": "2026-05-17",
+  "doc_version": "0.2",
+  "phase": "design",
+  "tags": [
+    "memory",
+    "local-first",
+    "hermes-plugin",
+    "qdrant",
+    "sqlite",
+    "fts5",
+    "dreaming",
+    "narrative-thread"
+  ],
+  "primary_deliverables": [
+    "plugins/memory/hermes-local/ (Hermes MemoryProvider plugin)",
+    "hermes-memory-gateway (FastAPI service)",
+    "Dreamer cron job (Qwen3.6-35B @ .105, 3am nightly)",
+    "Memory CLI (memory init, memory db init, memory search, memory dream)",
+    "One-shot migration tool (holographic -> hermes-local)"
+  ],
+  "depends_on": {
+    "hermes_core": [
+      "agent.memory_provider.MemoryProvider ABC",
+      "agent.memory_manager.MemoryManager",
+      "hermes_constants.get_hermes_home",
+      "hermes_state.apply_wal_with_fallback"
+    ],
+    "external_services": {
+      "qdrant": "http://localhost:6333",
+      "lms_embeddings": "http://localhost:1235 (text-embedding-nomic-embed-text-v1.5)",
+      "spark2_llm": "http://192.168.2.105:1234 (Qwen3.6-35B, 262k ctx)"
+    }
+  },
+  "repos": [
+    {
+      "name": "hermes-agent",
+      "url": "https://github.com/NousResearch/hermes-agent.git",
+      "local_path": "/home/dmccarty/.hermes/hermes-agent",
+      "branch": "main",
+      "code_lives_under": "plugins/memory/hermes-local/"
+    }
+  ],
+  "data_locations": {
+    "base": "~/.hermes/memory/",
+    "sqlite": "~/.hermes/memory/memory.sqlite",
+    "raw_jsonl": "~/.hermes/memory/raw/YYYY/YYYY-MM-DD/",
+    "qmd_export": "~/.hermes/memory/qmd/YYYY/YYYY-MM-DD/",
+    "daily_files": "~/.hermes/memories/YYYY-MM-DD.md",
+    "project_files": "~/.hermes/memory/projects/<project>/",
+    "dreams": "~/.hermes/memory/dreams/",
+    "session_threads": "~/.hermes/SESSION-THREAD/{session_id}.md",
+    "config": "~/.hermes/config.yaml (plugins.hermes-local-memory + memory.provider)"
+  },
+  "qdrant_collections": [
+    "hermes_memory_chunks_nomic_v15",
+    "hermes_memory_summaries_nomic_v15",
+    "hermes_memory_facts_nomic_v15",
+    "hermes_memory_decisions_nomic_v15"
+  ]
+}

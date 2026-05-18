@@ -1,0 +1,128 @@
+# Sample profile configuration overrides for hermes-memory specialist profiles.
+#
+# These are NOT applied automatically — they're a reference for the per-profile
+# `~/.hermes/profiles/hm-<role>/config.yaml` settings you may want to set after
+# running `hermes profile create hm-<role> --clone`.
+#
+# The clone copies the default profile's full config. Most of it is fine as-is.
+# What you typically want to override per profile is:
+#   - the active model (use the hermes CLI: `hermes -p hm-<role> model <name>`)
+#   - the disabled_toolsets (lock down roles to their needed surface area)
+#   - skills (force-load the skills relevant to the role)
+#
+# Don't edit a profile's config.yaml unless you have a reason — the wrapper
+# CLI commands handle most of what you need.
+
+# ---------------------------------------------------------------------------
+# hm-orchestrator  — Ralph loop, runs every 30 min via cron
+# Apply via:  hermes -p hm-orchestrator ...
+# ---------------------------------------------------------------------------
+# Model:           unsloth/Qwen3.6-27B-NVFP4 @ lms_spark2 (test-bed: free local)
+# Reasoning effort: medium
+# Skills to keep available (force-load): kanban-orchestrator
+# Skills NOT needed:  developer/QA/architect-specific things
+# Disabled toolsets: image_gen, computer_use, browser, comfyui, code_exec
+#
+# This profile runs the project's state-machine heartbeat. It needs:
+#   - read_file / write_file / patch (state files)
+#   - terminal (hermes kanban ls / show / create / reclaim, cronjob mgmt)
+#   - send_message (telegram escalations)
+# Anything else is out of scope per its SOUL §10.
+
+# ---------------------------------------------------------------------------
+# hm-planner  — analytical, decomposition-focused
+# Apply via:  hermes -p hm-planner ...
+# ---------------------------------------------------------------------------
+# Model:           openrouter/minimax/minimax-m2.7    (test-bed: paid OpenRouter)
+# Reasoning effort: medium
+# Skills to keep available (force-load): kanban-orchestrator
+# Skills NOT needed:  developer/QA-specific things
+# Disabled toolsets: image_gen, computer_use, browser, comfyui
+
+# ---------------------------------------------------------------------------
+# hm-architect — design-focused, no code execution
+# ---------------------------------------------------------------------------
+# Model:           unsloth/Qwen3.6-27B-NVFP4 @ lms_spark2 (test-bed: free local)
+# Reasoning effort: high (specs need real thinking)
+# Skills to keep available: kanban-worker, design-md
+# Disabled toolsets: image_gen, computer_use, browser
+
+# ---------------------------------------------------------------------------
+# hm-developer — implementer, gets full tooling
+# ---------------------------------------------------------------------------
+# Model:           openrouter/minimax/minimax-m2.7    (test-bed: paid OpenRouter)
+# Reasoning effort: medium
+# Skills to keep available:
+#   kanban-worker
+#   test-driven-development
+#   systematic-debugging
+#   github-pr-workflow  (for branches + commits, not push)
+#   hermes-agent-skill-authoring  (if writing helper skills)
+# Disabled toolsets: image_gen, computer_use, browser, comfyui
+
+# ---------------------------------------------------------------------------
+# hm-qa — verifier, READ + RUN-TESTS
+# ---------------------------------------------------------------------------
+# Model:           unsloth/Qwen3.6-27B-NVFP4 @ lms_spark2 (test-bed: free local)
+# Reasoning effort: medium
+# Skills to keep available:
+#   kanban-worker
+#   requesting-code-review
+#   test-driven-development
+#   systematic-debugging
+# Disabled toolsets: image_gen, computer_use, browser
+#
+# Recommended: restrict to READ tools only (so QA can't accidentally write code).
+# At minimum, ensure the SOUL.md guardrail (NEVER write feature code) is loud.
+
+# ---------------------------------------------------------------------------
+# hm-docs — narrow file-edit role, minimal toolset
+# ---------------------------------------------------------------------------
+# Model:           unsloth/Qwen3.6-27B-NVFP4 @ lms_spark2 (test-bed: free local)
+# Reasoning effort: low
+# Skills to keep available:
+#   kanban-worker
+# Disabled toolsets: image_gen, computer_use, browser, comfyui, code_exec
+#
+# This profile only needs read_file / write_file / patch / terminal (for git log)
+# / kanban_*. Keep its surface small.
+
+# ===========================================================================
+# Test-bed rationale (David, 2026-05-17):
+# ===========================================================================
+#
+# MiniMax M2.7 (paid OpenRouter) drives the two roles where reasoning quality
+# most affects downstream throughput — hm-planner decomposes work for all
+# others, and hm-developer is the bottleneck on actual delivery. A planner
+# that misreads Plan.md or a developer that produces sloppy code wastes more
+# downstream effort than a sharp QA or docs role saves.
+#
+# Qwen3.6-35B (local Spark2 @ .105:1234) handles the other three. David's
+# stated preference (answers.txt Q5): impressed with Qwen3.6 intellect+speed;
+# wants Nemotron avoided. Local = zero per-token cost.
+#
+# We'll evaluate this at the end of Phase 1:
+#   - If Qwen3.6 is matching MiniMax on architect/qa quality → migrate
+#     planner+developer to Qwen3.6 too. Drop OpenRouter dependency.
+#   - If MiniMax is clearly better on planner+developer → keep the split.
+#   - If MiniMax is overkill for hm-developer (most stories are small) →
+#     switch hm-developer to Qwen3.6, keep MiniMax only for planning.
+#
+# Swapping is a one-liner per profile: `hermes -p <profile> model <name>`.
+
+# ===========================================================================
+# Notes on shared infrastructure (already configured in default profile,
+# inherited via --clone):
+# ===========================================================================
+#
+# All profiles share:
+#   - Qdrant @ http://localhost:6333
+#   - LMS embeddings @ http://192.168.2.105:1235
+#   - Spark2 LLM @ http://192.168.2.105:1234
+#   - hermes-agent code checkout at ~/.hermes/hermes-agent
+#   - kanban DB at ~/.hermes/kanban.db (shared board)
+#   - memory.provider: holographic (current default) — flips to hermes-local
+#     after the new plugin lands (Phase 2)
+#
+# These are inherited from `default` via `hermes profile create --clone` so
+# you don't need to copy them per profile.

@@ -1,30 +1,32 @@
-# TDD: Hermes Local Long-Duration Memory System
+# TDD: Hermes Local Memory Pack
 
-**Document:** `TDD.md`  
-**Product Name:** Hermes Local Memory Pack  
-**Owner:** David McCarty  
-**Version:** 0.1  
-**Date:** 2026-05-17  
+**Document:** `TDD.md`
+**Project:** `hermes-memory`
+**Owner:** David McCarty
+**Version:** 0.2 (rewrite — see `docs/archive/v0.1-original/` for v0.1)
+**Date:** 2026-05-17
 **Status:** Draft technical design
 
 ---
 
 ## 1. Technical Summary
 
-Hermes Local Memory Pack is a local-first memory subsystem that gives Hermes durable long-duration memory, lossless historical chat recall, semantic and keyword search, project/daily memory files, and recursive “dreaming” consolidation.
+The system splits into three deployment artifacts but **one shared library**:
 
-The core principle is:
+| Artifact | Where it runs | What it owns |
+|---|---|---|
+| `plugins/memory/hermes-local/` | In-process inside Hermes (`AIAgent` process) | Capture path, tool dispatch, narrative thread, prefetch |
+| `hermes_memory_core/` (library) | Imported by both plugin and gateway | SQLite, Qdrant, embeddings, hybrid scorer, redaction, source resolver |
+| `hermes-memory-gateway` (FastAPI) | Standalone systemd service on `localhost:8787` | HTTP endpoints; runs dreamer; future cross-agent access |
 
-> Raw history is the immutable source of truth. All summaries, facts, vector chunks, graph nodes, and memory files are derived views.
+The plugin **never speaks to Qdrant/SQLite directly itself** — it always goes through `hermes_memory_core`. The gateway is a thin HTTP shell over the same library. This means:
 
-The architecture intentionally separates:
+- Tests target one library.
+- Schema/index logic exists exactly once.
+- Plugin works even if the gateway is down (it calls the library directly).
+- Gateway can run the dreamer (cron) without needing the agent process alive.
 
-1. **Capture** — append-only storage of every event.
-2. **Storage** — raw JSONL/QMD, SQLite, Qdrant, optional Mem0 OSS.
-3. **Indexing** — keyword and vector indexing.
-4. **Consolidation** — local dreaming process.
-5. **Serving** — tool/MCP/API access for Hermes.
-6. **Curation** — human-editable memory files.
+**Core principle:** raw history is immutable. Summaries, facts, chunks, vectors, daily/project files are derived views that can be rebuilt from raw at any time.
 
 ---
 
@@ -32,788 +34,696 @@ The architecture intentionally separates:
 
 1. Local-first, no recurring memory provider cost.
 2. Complete historical preservation.
-3. Fast retrieval across months/years of conversations.
-4. Dual retrieval modes:
-   - semantic vector search
-   - exact keyword search
-5. Durable memory facts with source traceability.
-6. Clear separation between raw and derived memory.
-7. Hermes-compatible tool interface.
-8. Extensible to OpenClaw, Agent Zero, meeting transcripts, and document ingestion.
-9. Optional Mem0 OSS without lock-in.
-10. Optional graph memory after MVP.
+3. Fast retrieval across years of conversation.
+4. Dual indexing: semantic + keyword + structural.
+5. Source-traceability on every derived item.
+6. Clear separation: raw vs. derived.
+7. Single tool surface in Hermes.
+8. Plugin functional even if gateway is down.
+9. Schema independence from Hermes core.
+10. Graceful degradation when any backend is unavailable.
+11. Idempotent capture / indexing / dreaming.
+12. Rebuildable: nuke any derived store and rebuild from raw.
 
 ---
 
-## 3. High-Level Component Diagram
+## 3. Component Diagram
 
 ```text
-+----------------------+
-|      Hermes Agent    |
-|  MEMORY.md / USER.md |
-+----------+-----------+
-           |
-           | Tool/MCP/HTTP calls
-           v
-+------------------------------+
-| Local Memory Gateway          |
-| - search_semantic             |
-| - search_keyword              |
-| - search_hybrid               |
-| - add_fact                    |
-| - add_decision                |
-| - dream_now                   |
-| - get_session                 |
-+---------------+--------------+
-                |
-                v
-+------------------------------+
-| Memory Service API            |
-| - capture manager             |
-| - retrieval orchestrator      |
-| - write manager               |
-| - source reference resolver   |
-| - redaction guard             |
-+-------+-----------+----------+
-        |           |
-        |           |
-        v           v
-+---------------+  +----------------+
-| SQLite DB     |  | Qdrant         |
-| - sessions    |  | - vectors      |
-| - turns       |  | - payloads     |
-| - chunks      |  | - filters      |
-| - facts       |  | - collections  |
-| - decisions   |  +----------------+
-| - FTS5        |
-+-------+-------+
-        |
-        v
-+------------------------------+
-| Filesystem Memory             |
-| /raw JSONL                    |
-| /qmd session exports          |
-| /daily memory                 |
-| /projects memory              |
-| /facts / decisions            |
-| /dream reports                |
-+---------------+--------------+
-                |
-                v
-+------------------------------+
-| Dreamer / Consolidator         |
-| - summarization                |
-| - fact extraction              |
-| - decision extraction          |
-| - contradiction detection      |
-| - project memory update        |
-| - index refresh                |
-+------------------------------+
++---------------------------------------------------------------------------+
+|                          Hermes Agent (in-process)                        |
+|                                                                           |
+|  AIAgent + MemoryManager                                                  |
+|  |                                                                        |
+|  | Hermes loads exactly ONE active MemoryProvider via config              |
+|  v                                                                        |
+|  +-----------------------------------------------------------------+     |
+|  | plugins/memory/hermes-local/   (this plugin)                    |     |
+|  |   __init__.py    -> HermesLocalProvider(MemoryProvider)         |     |
+|  |   plugin.yaml    -> name, hooks                                 |     |
+|  |   narrative.py   -> session thread (fixed /new injection)       |     |
+|  |   tools.py       -> 6 tool schemas + dispatch                   |     |
+|  |   prefetch.py    -> background hybrid prefetch                  |     |
+|  +-----------------------+---------------------------+-------------+     |
+|                          |                           |                    |
+|       in-process import  |                           |  HTTP (heavy ops)  |
+|                          v                           v                    |
+|  +---------------------------------+      +-------------------------+     |
+|  | hermes_memory_core/  (library)  |      | hermes-memory-gateway   |     |
+|  |                                 |      | (FastAPI :8787)         |     |
+|  | store/                          |      |                         |     |
+|  |   sqlite.py    SQLite + FTS5    |      | /memory/query           |     |
+|  |   qdrant.py    Vector store     |      | /memory/write           |     |
+|  |   fs.py        JSONL + QMD      |      | /memory/source/{ref}    |     |
+|  | search/                         |      | /memory/dream           |     |
+|  |   hybrid.py    Scorer + merge   |      | /memory/reindex         |     |
+|  |   hrr.py       Forked HRR       |      | /memory/recent_context  |     |
+|  | write/                          |      | /health/*               |     |
+|  |   pipeline.py  Canonical write  |      |                         |     |
+|  |   redaction.py Secret scanner   |      | (Same library inside)   |     |
+|  | source.py      Resolver         |      +-------------+-----------+     |
+|  | embed.py       LMS client       |                    |                  |
+|  | chunk.py       Chunker          |                    | (cron starts    |
+|  | dream/                          |                    |  dream worker)  |
+|  |   worker.py    Orchestrator     |                    v                  |
+|  |   prompts/*    Templates        |      +-------------------------+     |
+|  |   contradict.py Heuristic       |      | dreamer cron (3am)      |     |
+|  +-----+--------------+------------+      | /etc/cron.d/hermes-     |     |
+|        |              |                   | memory-dream            |     |
+|        v              v                   +-------------------------+     |
+|   ~/.hermes/memory/   Qdrant :6333                                        |
+|     memory.sqlite     hermes_memory_*                                     |
+|     raw/  qmd/        (versioned)                                         |
+|     daily/  projects/                                                     |
+|     dreams/                                                               |
+|     SESSION-THREAD/{session_id}.md                                        |
++---------------------------------------------------------------------------+
 ```
 
 ### 3.1 Centralized Access Rule
 
-All backend stores shown in the diagram are private implementation details behind the Local Memory Gateway. Hermes does not directly connect to Qdrant, SQLite, raw JSONL, QMD files, daily files, project files, Mem0, or graph memory.
-
-Hermes sees one programmatic interface:
-
-```text
-memory_query()
-memory_write()
-memory_get_source()
-memory_recent_context()
-memory_dream()
-memory_reindex()
-memory_update()
-```
-
-This prevents memory silos and ensures every answer can be merged, ranked, and source-traced centrally.
+Hermes interacts with memory exclusively through the registered plugin tools. The plugin owns the contract; backends are private. No code outside `hermes_memory_core` SQLs `memory.sqlite` directly.
 
 ---
 
-## 4. Runtime Flow Overview
+## 4. Runtime Flows
 
-### 4.1 Conversation Capture Flow
-
-```text
-Hermes turn occurs
-    |
-    v
-Memory Gateway receives event
-    |
-    v
-Redaction guard scans content
-    |
-    v
-Append event to raw JSONL
-    |
-    v
-Write normalized turn to SQLite
-    |
-    v
-Export/update QMD session file
-    |
-    v
-Mark turn as pending chunk/index/dream
-```
-
-### 4.2 Indexing Flow
+### 4.1 Capture (per turn)
 
 ```text
-New raw turns
-    |
-    v
-Chunker groups turns into retrieval units
-    |
-    +--> SQLite chunks table
-    |
-    +--> SQLite FTS5 keyword index
-    |
-    +--> local embedding model
-             |
-             v
-          Qdrant upsert
-          with payload metadata
+Hermes turn completes
+    -> AIAgent calls MemoryManager.sync_turn(user, asst, session_id)
+        -> HermesLocalProvider.sync_turn()
+            -> hermes_memory_core.write.pipeline.capture_event(event)
+                -> redaction.scan(content) -> redacted_content
+                -> append JSONL to memory/raw/YYYY/YYYY-MM-DD/{session_id}.jsonl
+                -> insert rows into sessions + turns (SQLite WAL)
+                -> queue (chunk + embed + Qdrant upsert) on worker thread
+                -> mark turns.index_status = 'pending'
+                -> append/update QMD export
+            -> narrative.update_thread(user, asst)   # rolling 5-window
 ```
 
-### 4.3 Hybrid Search Flow
+**Synchronous portion**: redaction + JSONL + SQLite insert (fast, < 50 ms).
+**Async portion**: chunking + embedding + Qdrant upsert. Status tracked in SQLite so retries are idempotent.
+
+### 4.2 Indexing (async worker)
 
 ```text
-Hermes asks memory_search_hybrid(query, filters)
-    |
-    v
-Retrieval orchestrator
-    |
-    +--> Keyword search in SQLite FTS5
-    |
-    +--> Semantic search in Qdrant
-    |
-    v
-Merge results
-    |
-    v
-Apply filters / ranking / dedupe
-    |
-    v
-Return excerpts + source references
+Indexing queue tick
+    -> select * from turns where index_status = 'pending' limit BATCH
+    -> chunk(turns) -> chunks[]
+    -> insert chunks into chunks + chunks_fts
+    -> embed.batch(chunk.text) -> vectors[]
+    -> qdrant.upsert(chunks_collection, vectors, payloads)
+    -> update chunks.qdrant_point_id, turns.index_status = 'indexed'
 ```
 
-### 4.4 Dreaming Flow
+If embedding endpoint is down: leave `index_status='pending'`, retry next tick. **Reads still work** because hybrid scorer redistributes weights.
+
+### 4.3 Hybrid Search
 
 ```text
-Scheduled or manual dream trigger
-    |
-    v
-Load unprocessed sessions/turns
-    |
-    v
-Group by project/topic/day/entity
-    |
-    v
-Local LLM creates:
-  - session summary
-  - daily summary
-  - facts
-  - decisions
-  - open questions
-  - contradictions
-    |
-    v
-Validation + dedupe + source linking
-    |
-    v
-Write derived memory:
-  - SQLite facts/decisions/questions
-  - Markdown/QMD memory files
-  - dream report
-    |
-    v
-Refresh indexes
-    |
-    v
-Update checkpoints
+memory_query(query, mode='hybrid', filters)
+    -> hybrid.search(query, filters)
+        -> parallel:
+            * sqlite.fts5_search(query, filters)        -> fts_hits
+            * embed(query); qdrant.search(vec, filters) -> qd_hits
+            * jaccard(query_tokens, candidate_tokens)
+            * hrr.encode + hrr.similarity (if numpy)
+        -> normalize_scores(per backend)
+        -> score = w_fts*fts + w_qd*qd + w_jac*jac + w_hrr*hrr
+                   * trust * freshness_decay
+        -> dedupe by (memory_id, source_ref, content_hash)
+        -> sort desc, take top-K
+    -> normalize_results() (see §10)
 ```
 
-### 4.5 Memory Read in Hermes
+### 4.4 Source Resolution
+
+```text
+memory_get_source(source_ref)
+    -> parse_ref(source_ref) -> (kind, args)
+    -> dispatch:
+        session#turn       -> read JSONL, locate turn_id, return content + turn metadata
+        session#turns=a-b  -> stream a..b range
+        session#turn#tool  -> turn + tool_call extraction
+        fact:{id}          -> SQLite facts row + linked source refs
+        decision:{id}      -> SQLite decisions row + linked source refs
+        daily:{date}       -> read ~/.hermes/memories/{date}.md
+        project:{p}/...    -> read project file, navigate to heading
+        dream:{run_id}     -> read memory/dreams/...
+    -> return { kind, path, content, excerpt, expandable: bool }
+```
+
+### 4.5 Dreaming (nightly cron)
+
+```text
+3am cron -> systemctl start hermes-memory-dream.service
+    -> hermes_memory_core.dream.worker.run(scope='since_last')
+        -> select sessions where dream_status='pending' (or new turns since checkpoint)
+        -> group by (session, day, project)
+        -> for each group:
+            * call Qwen3.6-35B via LMS with prompts/{summarize_session.md}
+            * extract candidate facts, decisions, open_questions (JSON output)
+            * for each candidate:
+                - run redaction (defense in depth — already done at capture)
+                - call contradict.find_conflicts(candidate)
+                - call pipeline.write_memory(...) (canonical write path)
+        * update daily memory file (~/.hermes/memories/YYYY-MM-DD.md)
+        * update project memory files
+        * write dream report (memory/dreams/YYYY-MM-DD-HHMM.md)
+        * update checkpoints (last_dream_run_at, processed_turn_ids)
+        * mark dream_status='dreamed' on processed turns
+```
+
+Idempotency: dream runs by `(session_id, dream_run_id)` are stamped; reruns of the same scope are a no-op.
+
+### 4.6 Memory Read in Hermes (the agent-facing loop)
 
 ```text
 User asks question
-    |
-    v
-Hermes calls local memory tools
-    |
-    v
-Memory Gateway returns top contextual memories
-    |
-    v
-Hermes composes answer with source references
+    -> Hermes prefetch hook fires: provider.prefetch(query, session_id)
+        -> returns cached top-3 from background queue_prefetch
+    -> System prompt block: provider.system_prompt_block()
+        -> pinned user facts + tiny "active project" block
+    -> Hermes constructs context, calls model
+    -> Model calls memory_query (or directly answers)
+    -> tool dispatched -> handle_tool_call() -> core.search.hybrid.search()
+    -> returns normalized results with source refs
+    -> Model composes answer with citations
 ```
 
 ---
 
-## 4A. Central Memory Control Plane
+## 4A. Central Control Plane (carried from v0.1)
 
-The central architectural requirement is that Hermes shall not interact with each memory backend separately. Hermes shall interact with one central memory interface, and that interface shall orchestrate all backend memory stores.
-
-```text
-Hermes
-  |
-  | one provider/tool/MCP surface
-  v
-Local Memory Gateway
-  |
-  v
-Memory Orchestrator
-  |
-  +-- Raw JSONL archive
-  +-- QMD/Markdown session files
-  +-- SQLite canonical ledger
-  +-- SQLite FTS5 keyword search
-  +-- Qdrant semantic search
-  +-- Daily memory files
-  +-- Project memory files
-  +-- Optional Mem0 OSS mirror
-  +-- Optional graph memory
-```
-
-### 4A.1 Memory Gateway Responsibilities
-
-The Local Memory Gateway is responsible for:
-
-- exposing one programmatic memory interface
-- routing reads to the right backends
-- routing writes through the canonical write path
-- merging and reranking retrieval results
-- deduplicating by source reference and content hash
-- resolving original sources
-- enforcing redaction and write safety
-- updating derived indexes
-- hiding backend implementation from Hermes
-- supporting future agents such as OpenClaw and Agent Zero
-
-### 4A.2 Memory Orchestrator Responsibilities
-
-The Memory Orchestrator is the internal runtime component inside the gateway.
-
-Responsibilities:
+The plugin is the only memory surface in Hermes. The core library is the only memory engine. The gateway exposes the same engine over HTTP for processes that aren't the agent (cron dreamer, future cross-agent).
 
 ```text
-Query orchestration:
-  - classify query intent
-  - select search mode
-  - select backends
-  - run searches
-  - merge results
-  - rerank results
-  - dedupe results
-  - normalize result shape
+Hermes  --plugin tools-->  hermes_memory_core
+   (in-process)             |
+                            +--> SQLite + FTS5
+                            +--> Qdrant
+                            +--> filesystem (raw, qmd, daily, projects, dreams)
+                            +--> embeddings (LMS @ .105:1235)
+                            +--> dreamer LLM (Qwen3.6 @ .105:1234)
 
-Write orchestration:
-  - validate write
-  - require source reference
-  - check duplicates
-  - check contradictions
-  - write canonical SQLite record
-  - update Markdown/QMD files
-  - update FTS
-  - update Qdrant
-  - optionally mirror to Mem0
-  - optionally update graph
-
-Source orchestration:
-  - parse source_ref
-  - retrieve raw source
-  - return source excerpts
-  - support expansion from excerpt to full session
+Cron / future clients --HTTP--> hermes-memory-gateway --> hermes_memory_core
+                                  (FastAPI :8787)
 ```
 
-### 4A.3 Central Interface Contract
+---
 
-The gateway shall expose these primary functions:
+## 5. Plugin Surface
 
-```text
-memory_query
-memory_write
-memory_get_source
-memory_recent_context
-memory_dream
-memory_reindex
-memory_update
+### 5.1 `plugin.yaml`
+
+```yaml
+name: hermes-local
+version: 0.2.0
+description: "Hermes Local Memory — lossless capture, hybrid retrieval, dreaming, narrative thread (local-first, zero per-token cost)."
+hooks:
+  - on_session_end
+  - on_session_switch
+  - on_pre_compress
+  - on_memory_write
+  - on_delegation
 ```
 
-Secondary functions may exist internally, but Hermes should primarily use these.
+### 5.2 Tool Schemas (registered in `get_tool_schemas`)
 
-### 4A.4 Central Query Modes
-
-`memory_query` shall support:
-
-```text
-hybrid
-semantic
-keyword
-facts
-decisions
-open_questions
-sessions
-daily
-project
-source
-recent
-graph
-```
-
-The default mode shall be `hybrid`.
-
-### 4A.5 Central Result Normalization
-
-All backends must return results converted into this common result object:
+#### `memory_query`
 
 ```json
 {
-  "memory_id": "string",
-  "type": "fact | decision | open_question | session | turn_chunk | daily | project_memory | graph",
-  "project": "string",
-  "text": "string",
-  "score": 0.0,
-  "confidence": 0.0,
-  "source_ref": "string",
-  "backend_hits": ["fts", "qdrant"],
-  "created_at": "timestamp",
-  "updated_at": "timestamp",
-  "metadata": {}
+  "name": "memory_query",
+  "description": "Search the local memory. Default mode 'hybrid' combines semantic + keyword + structural. Modes also include 'semantic', 'keyword', 'facts', 'decisions', 'open_questions', 'sessions', 'daily', 'project', 'recent', 'probe', 'related', 'reason'.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query":   {"type": "string"},
+      "mode":    {"type": "string", "default": "hybrid"},
+      "project": {"type": "string"},
+      "entity":  {"type": "string"},
+      "entities":{"type": "array",  "items": {"type": "string"}},
+      "filters": {"type": "object"},
+      "limit":   {"type": "integer","default": 10}
+    },
+    "required": ["query"]
+  }
 }
 ```
 
-### 4A.6 Central Write Path
-
-Durable memory writes shall flow through the gateway.
-
-```text
-memory_write request
-  |
-  v
-validate + redact + source-check
-  |
-  v
-dedupe + contradiction check
-  |
-  v
-write canonical record to SQLite
-  |
-  +--> update project/daily Markdown files
-  +--> update SQLite FTS
-  +--> embed and upsert to Qdrant
-  +--> optional Mem0 mirror
-  +--> optional graph write
-  |
-  v
-return memory_id + source_ref
-```
-
-No durable fact, decision, or open question should be written only to Markdown, only to Qdrant, or only to Mem0.
-
-### 4A.7 Central Read Path
-
-```text
-memory_query request
-  |
-  v
-parse query + filters
-  |
-  v
-select backends
-  |
-  +--> SQLite facts/decisions/questions
-  +--> SQLite FTS
-  +--> Qdrant
-  +--> raw/session/daily/project file indexes
-  +--> optional Mem0
-  +--> optional graph
-  |
-  v
-merge + dedupe + rerank
-  |
-  v
-resolve source refs as needed
-  |
-  v
-return normalized source-backed results
-```
-
-### 4A.8 Central Source Resolver
-
-`memory_get_source` shall support source refs such as:
-
-```text
-session:{session_id}#turn={turn_id}
-session:{session_id}#turns={start}-{end}
-daily:{YYYY-MM-DD}
-project:{project}/memory.md#section={heading}
-fact:{fact_id}
-decision:{decision_id}
-question:{question_id}
-dream:{dream_run_id}
-```
-
-### 4A.9 Gateway as MCP Server
-
-The gateway should be packaged so it can run as:
-
-1. local HTTP API
-2. CLI
-3. MCP server
-4. future Hermes custom memory provider adapter
-
-The MCP/tool bridge is the preferred first integration because it can later be reused by Hermes, OpenClaw, Agent Zero, or other local agents.
-
-
----
-
-## 5. Technical Components
-
-## 5.1 Local Memory Gateway
-
-The Local Memory Gateway is the agent-facing access layer.
-
-Recommended implementation:
-
-- FastAPI service
-- Optional MCP server wrapper
-- CLI wrapper for debugging
-- Python package for internal calls
-
-Responsibilities:
-
-- Expose memory tools
-- Validate requests
-- Apply redaction rules
-- Route reads/writes
-- Normalize results
-- Return source references
-- Keep Hermes decoupled from implementation details
-
-Primary central endpoints/tools:
-
-```text
-POST /memory/query
-POST /memory/write
-GET  /memory/source/{source_ref}
-POST /memory/recent_context
-POST /memory/dream
-POST /memory/reindex
-POST /memory/update
-
-# Lower-level/internal endpoints may include:
-POST /capture/event
-POST /search/semantic
-POST /search/keyword
-POST /search/hybrid
-GET  /sessions/{session_id}
-GET  /daily/{date}
-GET  /projects/{project}/memory
-POST /facts
-POST /decisions
-POST /questions
-POST /dream/run
-GET  /sources/{source_ref}
-```
-
----
-
-## 5.2 Capture Manager
-
-Responsibilities:
-
-- Accept conversation events
-- Assign IDs
-- Hash content
-- Append to JSONL
-- Write normalized records to SQLite
-- Update QMD export
-- Mark records for indexing and dreaming
-
-Event example:
+#### `memory_write`
 
 ```json
 {
-  "event_id": "evt_20260517_000042",
-  "session_id": "sess_20260517_hermes_001",
-  "turn_id": 42,
-  "timestamp": "2026-05-17T12:20:00-05:00",
-  "agent": "hermes",
-  "role": "user",
-  "project": "hermes-memory",
-  "content": "I prefer a local solution that does not cost additional...",
-  "tags": ["memory", "local-first", "requirements"],
-  "source": "chat",
-  "tool_calls": [],
-  "attachments": [],
-  "metadata": {
-    "client": "hermes",
-    "model": null
-  },
-  "hash": "sha256:..."
+  "name": "memory_write",
+  "description": "Write a durable memory: fact / decision / open_question. Source reference required (or force_no_redact=true with explicit override).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "type":       {"type": "string", "enum": ["fact","decision","open_question"]},
+      "text":       {"type": "string"},
+      "project":    {"type": "string"},
+      "scope":      {"type": "string", "enum": ["user","project","general"]},
+      "source_ref": {"type": "string"},
+      "confidence": {"type": "number"},
+      "tags":       {"type": "string"},
+      "rationale":  {"type": "string"},
+      "owner":      {"type": "string"},
+      "priority":   {"type": "string"},
+      "force_no_redact": {"type": "boolean", "default": false}
+    },
+    "required": ["type","text"]
+  }
 }
+```
+
+#### `memory_update`
+
+```json
+{
+  "name": "memory_update",
+  "description": "Update an existing memory's content / trust / tags / status / category.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "memory_id":   {"type": "string"},
+      "text":        {"type": "string"},
+      "trust_delta": {"type": "number"},
+      "tags":        {"type": "string"},
+      "status":      {"type": "string", "enum": ["active","superseded","disputed","archived"]},
+      "category":    {"type": "string"}
+    },
+    "required": ["memory_id"]
+  }
+}
+```
+
+#### `memory_get_source`
+
+```json
+{
+  "name": "memory_get_source",
+  "description": "Resolve a source_ref back to original content + excerpt.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "source_ref": {"type": "string"},
+      "expand":     {"type": "boolean", "default": false}
+    },
+    "required": ["source_ref"]
+  }
+}
+```
+
+#### `memory_recent_context`
+
+```json
+{
+  "name": "memory_recent_context",
+  "description": "Compact working set for session start: pinned facts + active project facts + recent decisions + open questions, token-budget aware.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "project":   {"type": "string"},
+      "max_chars": {"type": "integer", "default": 4000}
+    }
+  }
+}
+```
+
+#### `memory_dream_now`
+
+```json
+{
+  "name": "memory_dream_now",
+  "description": "Trigger an immediate dream run. Default scope 'since_last' processes turns since last checkpoint.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "scope":   {"type": "string", "default": "since_last", "enum": ["since_last","today","date","project","weekly"]},
+      "date":    {"type": "string"},
+      "project": {"type": "string"},
+      "deep":    {"type": "boolean", "default": false}
+    }
+  }
+}
+```
+
+#### `fact_feedback` (preserved from holographic)
+
+```json
+{
+  "name": "fact_feedback",
+  "description": "Rate a memory after using it. helpful=+0.05 trust, unhelpful=-0.10 trust.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "memory_id": {"type": "string"},
+      "action":    {"type": "string", "enum": ["helpful","unhelpful"]}
+    },
+    "required": ["memory_id","action"]
+  }
+}
+```
+
+### 5.3 Gateway HTTP Endpoints
+
+```text
+POST /memory/query              body: memory_query schema
+POST /memory/write              body: memory_write schema
+POST /memory/update             body: memory_update schema
+GET  /memory/source/{ref}       (URL-encoded source_ref)
+POST /memory/recent_context     body: memory_recent_context schema
+POST /memory/dream              body: memory_dream_now schema
+POST /memory/reindex            body: { scope, ranges }
+GET  /health                    overall
+GET  /health/sqlite             SQLite + FTS5 reachable
+GET  /health/qdrant             Qdrant ping + collection count
+GET  /health/llm                Dreamer LLM reachable (HEAD on LMS)
+GET  /health/embedding          LMS embedding reachable + correct dim
 ```
 
 ---
 
-## 5.3 Filesystem Memory Store
+## 6. Data Layer
 
-Recommended base path:
-
-```text
-~/ai-memory/hermes-local-memory/
-```
-
-Directory layout:
+### 6.1 Filesystem Layout
 
 ```text
-memory/
+# ── Plugin (shipped inside hermes-agent) ──────────────────────────────────
+hermes-agent/
+  plugins/memory/hermes-local/
+    __init__.py     — HermesLocalProvider (MemoryProvider ABC); register() gates on memory.provider=hermes-local
+    plugin.yaml     — name: hermes-local, version: 0.2.0, hooks: [on_session_end, on_session_switch, on_pre_compress, on_memory_write, on_delegation]
+    narrative.py    — Placeholder for narrative thread (Phase 5)
+    tools.py        — Placeholder for 7 tool schemas (Phase 2)
+    prefetch.py     — Placeholder for hybrid prefetch (Phase 4)
+    README.md       — Architecture overview and activation config
+
+  hermes_memory_core/       (shared library — imported by plugin AND gateway)
+    __init__.py     — HermesMemoryCore class; submodules importable independently
+    store/
+      __init__.py
+      sqlite.py     — SQLite + FTS5 persistence
+      qdrant.py     — Qdrant vector store client
+      fs.py         — JSONL / QMD filesystem
+    search/
+      __init__.py
+      hybrid.py     — Hybrid retrieval scorer
+      hrr.py        — HRR compositional retrieval
+    write/
+      __init__.py
+      pipeline.py   — Canonical write pipeline
+      redaction.py  — Secret scanner (AWS, GitHub, OpenAI, Anthropic, card, SSN, high-entropy)
+    source.py       — Source reference resolver
+    embed.py        — LMS embedding client
+    chunk.py        — Text chunker
+    dream/
+      __init__.py
+      worker.py     — Dreamer orchestrator
+      prompts/      — Dreamer prompt templates
+
+# ── Runtime data (created on first use) ───────────────────────────────────
+~/.hermes/memory/                         (owned by this project)
+  config/
+    memory.yaml                           (plugin reads from here OR ~/.hermes/config.yaml)
   raw/
-    2026/
-      2026-05-17/
-        sess_20260517_hermes_001.jsonl
-
+    2026/2026-05-17/{session_id}.jsonl
   qmd/
-    2026/
-      2026-05-17/
-        sess_20260517_hermes_001.qmd
-
-  daily/
-    2026/
-      2026-05-17.md
-
+    2026/2026-05-17/{session_id}.qmd
   projects/
     hermes/
-      memory.md
-      facts.md
-      decisions.md
-      open_questions.md
-      timeline.md
-      sources.md
-
-    openclaw/
-      memory.md
-      facts.md
-      decisions.md
-      open_questions.md
-      timeline.md
-      sources.md
-
-    local-ai-lab/
-      memory.md
-      facts.md
-      decisions.md
-      open_questions.md
-      timeline.md
-      sources.md
-
+      memory.md  facts.md  decisions.md  open_questions.md  timeline.md  sources.md
+    hermes-memory/...
+    openclaw/...
+    local-ai-lab/...
   entities/
-    hardware.md
-    models.md
-    tools.md
-    vendors.md
-    people.md
-
+    hardware.md  models.md  tools.md  vendors.md  people.md
   dreams/
-    2026/
-      2026-05-17-2300.md
-
+    2026/2026-05-17-0300.md
+  prompts/
+    summarize_session.md
+    summarize_day.md
+    extract_facts.md
+    extract_decisions.md
+    extract_open_questions.md
+    detect_contradictions.md
+    update_project_memory.md
   exports/
   backups/
-  config/
+  index/
+    memory.sqlite                         (canonical SQLite DB)
+    qdrant_snapshots/                     (created by `memory backup`)
+
+~/.hermes/memories/                       (carry-forward from existing)
+  2026-05-17.md
+
+~/.hermes/SESSION-THREAD/                 (carry-forward pattern from holographic)
+  {session_id}.md
 ```
 
----
-
-## 5.4 SQLite Database
-
-SQLite is used for local structured storage and keyword search.
-
-Database path:
-
-```text
-memory/index/memory.sqlite
-```
-
-SQLite is a small, self-contained, reliable embedded database. SQLite FTS5 supports efficient full-text search.
-
-### 5.4.1 Core Tables
-
-#### sessions
+### 6.2 SQLite Schema (`memory.sqlite`)
 
 ```sql
+-- session-level
 CREATE TABLE sessions (
-  session_id TEXT PRIMARY KEY,
-  agent TEXT NOT NULL,
-  title TEXT,
-  project TEXT,
-  started_at TEXT NOT NULL,
-  ended_at TEXT,
-  summary TEXT,
-  qmd_path TEXT,
-  raw_path TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  session_id   TEXT PRIMARY KEY,
+  agent        TEXT NOT NULL,
+  title        TEXT,
+  project      TEXT,
+  started_at   TEXT NOT NULL,
+  ended_at     TEXT,
+  summary      TEXT,
+  qmd_path     TEXT,
+  raw_path     TEXT,
+  source       TEXT,                      -- 'cli','telegram','tui','gateway','cron'
+  platform     TEXT,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
 );
-```
 
-#### turns
-
-```sql
+-- turn-level (lossless)
 CREATE TABLE turns (
-  turn_id TEXT PRIMARY KEY,
-  session_id TEXT NOT NULL,
-  sequence INTEGER NOT NULL,
-  timestamp TEXT NOT NULL,
-  role TEXT NOT NULL,
-  content TEXT NOT NULL,
-  content_hash TEXT NOT NULL,
-  project TEXT,
-  tags_json TEXT,
-  tool_calls_json TEXT,
+  turn_id          TEXT PRIMARY KEY,
+  session_id       TEXT NOT NULL,
+  sequence         INTEGER NOT NULL,
+  timestamp        TEXT NOT NULL,
+  role             TEXT NOT NULL,         -- 'user','assistant','system','tool'
+  content          TEXT NOT NULL,         -- post-redaction
+  raw_content_hash TEXT NOT NULL,         -- hash of original (pre-redaction)
+  content_hash     TEXT NOT NULL,         -- hash of stored content
+  project          TEXT,
+  tags_json        TEXT,
+  tool_calls_json  TEXT,
   attachments_json TEXT,
-  metadata_json TEXT,
-  index_status TEXT DEFAULT 'pending',
-  dream_status TEXT DEFAULT 'pending',
+  metadata_json    TEXT,
+  parent_turn_id   TEXT,
+  index_status     TEXT DEFAULT 'pending',-- 'pending','indexed','failed'
+  dream_status     TEXT DEFAULT 'pending',-- 'pending','dreamed'
+  redaction_applied INTEGER DEFAULT 0,
+  redaction_types_json TEXT,
   FOREIGN KEY(session_id) REFERENCES sessions(session_id)
 );
-```
+CREATE INDEX idx_turns_session ON turns(session_id, sequence);
+CREATE INDEX idx_turns_index_status ON turns(index_status);
+CREATE INDEX idx_turns_dream_status ON turns(dream_status);
 
-#### chunks
+-- raw events (defense in depth — JSONL is canonical, this is a duplicate index for fast diagnostics)
+CREATE TABLE raw_events (
+  event_id    TEXT PRIMARY KEY,
+  session_id  TEXT NOT NULL,
+  turn_id     TEXT,
+  timestamp   TEXT NOT NULL,
+  jsonl_path  TEXT NOT NULL,
+  byte_offset INTEGER NOT NULL,
+  content_hash TEXT NOT NULL
+);
 
-```sql
+-- retrieval chunks (multiple per turn possible)
 CREATE TABLE chunks (
-  chunk_id TEXT PRIMARY KEY,
-  session_id TEXT NOT NULL,
-  start_turn_id TEXT,
-  end_turn_id TEXT,
-  chunk_type TEXT NOT NULL,
-  project TEXT,
-  text TEXT NOT NULL,
-  summary TEXT,
-  source_ref TEXT NOT NULL,
+  chunk_id        TEXT PRIMARY KEY,
+  session_id      TEXT NOT NULL,
+  start_turn_id   TEXT,
+  end_turn_id     TEXT,
+  chunk_type      TEXT NOT NULL,         -- 'turn_window','tool_sequence','summary'
+  project         TEXT,
+  text            TEXT NOT NULL,
+  text_hash       TEXT NOT NULL,
+  summary         TEXT,
+  source_ref      TEXT NOT NULL,
   qdrant_point_id TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  embed_model     TEXT,                  -- which embedding model produced the vector
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  UNIQUE(text_hash, embed_model)
 );
-```
 
-#### facts
-
-```sql
+-- durable facts
 CREATE TABLE facts (
-  fact_id TEXT PRIMARY KEY,
-  fact_text TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  project TEXT,
-  entity TEXT,
-  confidence REAL,
-  status TEXT DEFAULT 'active',
-  first_seen_at TEXT,
+  fact_id           TEXT PRIMARY KEY,
+  fact_text         TEXT NOT NULL,
+  content_hash      TEXT NOT NULL UNIQUE,
+  scope             TEXT NOT NULL,        -- 'user','project','general'
+  category          TEXT DEFAULT 'general',
+  project           TEXT,
+  entity            TEXT,
+  confidence        REAL,
+  trust_score       REAL DEFAULT 0.5,
+  status            TEXT DEFAULT 'active', -- 'active','superseded','disputed','archived'
+  first_seen_at     TEXT,
   last_confirmed_at TEXT,
-  source_refs_json TEXT NOT NULL,
-  supersedes_fact_id TEXT,
-  superseded_by_fact_id TEXT,
-  tags_json TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  source_refs_json  TEXT NOT NULL,
+  supersedes_fact_id     TEXT,
+  superseded_by_fact_id  TEXT,
+  tags_json         TEXT,
+  retrieval_count   INTEGER DEFAULT 0,
+  helpful_count     INTEGER DEFAULT 0,
+  hrr_vector        BLOB,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL
 );
-```
+CREATE INDEX idx_facts_trust    ON facts(trust_score DESC);
+CREATE INDEX idx_facts_project  ON facts(project);
+CREATE INDEX idx_facts_status   ON facts(status);
+CREATE INDEX idx_facts_entity   ON facts(entity);
 
-#### decisions
+-- entities (lifted from holographic; entity resolution)
+CREATE TABLE entities (
+  entity_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT NOT NULL,
+  entity_type TEXT DEFAULT 'unknown',
+  aliases     TEXT DEFAULT '',
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX idx_entities_name ON entities(name);
 
-```sql
+CREATE TABLE fact_entities (
+  fact_id   TEXT REFERENCES facts(fact_id),
+  entity_id INTEGER REFERENCES entities(entity_id),
+  PRIMARY KEY (fact_id, entity_id)
+);
+
+-- decisions
 CREATE TABLE decisions (
-  decision_id TEXT PRIMARY KEY,
-  decision_text TEXT NOT NULL,
-  rationale TEXT,
-  project TEXT,
-  status TEXT DEFAULT 'active',
-  decision_date TEXT,
-  owner TEXT,
+  decision_id      TEXT PRIMARY KEY,
+  decision_text    TEXT NOT NULL,
+  rationale        TEXT,
+  project          TEXT,
+  status           TEXT DEFAULT 'active',
+  decision_date    TEXT,
+  owner            TEXT,
   source_refs_json TEXT NOT NULL,
   related_fact_ids_json TEXT,
-  implications TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  implications     TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
 );
-```
+CREATE INDEX idx_decisions_project ON decisions(project);
 
-#### open_questions
-
-```sql
+-- open questions
 CREATE TABLE open_questions (
-  question_id TEXT PRIMARY KEY,
-  question_text TEXT NOT NULL,
-  project TEXT,
-  priority TEXT,
-  status TEXT DEFAULT 'open',
+  question_id      TEXT PRIMARY KEY,
+  question_text    TEXT NOT NULL,
+  project          TEXT,
+  priority         TEXT,
+  status           TEXT DEFAULT 'open',
   source_refs_json TEXT NOT NULL,
-  next_action TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  next_action      TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
 );
-```
+CREATE INDEX idx_questions_project ON open_questions(project);
+CREATE INDEX idx_questions_status  ON open_questions(status);
 
-#### dream_runs
-
-```sql
+-- dream runs
 CREATE TABLE dream_runs (
-  dream_run_id TEXT PRIMARY KEY,
-  started_at TEXT NOT NULL,
-  ended_at TEXT,
-  status TEXT NOT NULL,
+  dream_run_id     TEXT PRIMARY KEY,
+  started_at       TEXT NOT NULL,
+  ended_at         TEXT,
+  status           TEXT NOT NULL,         -- 'running','completed','failed'
   input_scope_json TEXT,
-  output_path TEXT,
-  facts_created INTEGER DEFAULT 0,
-  facts_updated INTEGER DEFAULT 0,
+  output_path      TEXT,
+  facts_created    INTEGER DEFAULT 0,
+  facts_updated    INTEGER DEFAULT 0,
   decisions_created INTEGER DEFAULT 0,
   questions_created INTEGER DEFAULT 0,
-  errors_json TEXT
+  contradictions_detected INTEGER DEFAULT 0,
+  errors_json      TEXT,
+  llm_model        TEXT,                  -- 'qwen3.6-35b@spark2'
+  llm_endpoint     TEXT
 );
-```
 
-### 5.4.2 Full-Text Search Tables
+-- memory banks for HRR (lifted from holographic)
+CREATE TABLE memory_banks (
+  bank_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+  bank_name  TEXT NOT NULL UNIQUE,
+  vector     BLOB NOT NULL,
+  dim        INTEGER NOT NULL,
+  fact_count INTEGER DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 
-```sql
+-- schema versioning (we own this; never share with Hermes core)
+CREATE TABLE schema_version (
+  applied_at TEXT NOT NULL,
+  version    INTEGER NOT NULL PRIMARY KEY,
+  notes      TEXT
+);
+INSERT INTO schema_version VALUES (datetime('now'), 1, 'initial v0.2 schema');
+
+-- audit log (redaction events, force_no_redact overrides, write failures)
+CREATE TABLE audit_log (
+  audit_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp    TEXT NOT NULL,
+  actor        TEXT NOT NULL,            -- 'plugin','gateway','dreamer','migration','cli'
+  action       TEXT NOT NULL,
+  target_kind  TEXT,
+  target_id    TEXT,
+  detail_json  TEXT,
+  source_ref   TEXT
+);
+CREATE INDEX idx_audit_timestamp ON audit_log(timestamp);
+
+-- FTS5 virtual tables (all auto-synced via triggers)
 CREATE VIRTUAL TABLE turns_fts USING fts5(
-  content,
-  session_id UNINDEXED,
-  turn_id UNINDEXED,
-  project UNINDEXED,
-  timestamp UNINDEXED
+  content, session_id UNINDEXED, turn_id UNINDEXED, project UNINDEXED, timestamp UNINDEXED,
+  content=turns, content_rowid=ROWID
 );
 
 CREATE VIRTUAL TABLE chunks_fts USING fts5(
-  text,
-  chunk_id UNINDEXED,
-  session_id UNINDEXED,
-  project UNINDEXED,
-  source_ref UNINDEXED
+  text, chunk_id UNINDEXED, session_id UNINDEXED, project UNINDEXED, source_ref UNINDEXED,
+  content=chunks, content_rowid=ROWID
+);
+
+CREATE VIRTUAL TABLE facts_fts USING fts5(
+  fact_text, tags, fact_id UNINDEXED, project UNINDEXED, scope UNINDEXED,
+  content=facts, content_rowid=ROWID
+);
+
+CREATE VIRTUAL TABLE decisions_fts USING fts5(
+  decision_text, rationale, decision_id UNINDEXED, project UNINDEXED,
+  content=decisions, content_rowid=ROWID
 );
 ```
 
----
+FTS5 INSERT/DELETE/UPDATE triggers follow the holographic pattern (auto-sync content tables to FTS shadow tables).
 
-## 5.5 Qdrant Vector Store
-
-Qdrant is used for semantic search. Qdrant collections are named sets of vector points with payload metadata. Payload fields can be indexed and filtered.
-
-Recommended collections:
+### 6.3 Qdrant Collections (versioned by embed model)
 
 ```text
-memory_turn_chunks
-memory_summaries
-memory_facts
-memory_decisions
-memory_project_files
+hermes_memory_chunks_nomic_v15      (turn-window chunks)
+hermes_memory_summaries_nomic_v15   (session + daily summaries)
+hermes_memory_facts_nomic_v15       (fact text)
+hermes_memory_decisions_nomic_v15   (decision text)
 ```
 
-### 5.5.1 Point Payload
+Vector: 768d, distance: cosine. Payload indexes: `project`, `date`, `memory_type`, `session_id`, `tags`, `status`, `source_ref`.
 
-Example Qdrant payload:
+Example payload:
 
 ```json
 {
@@ -830,682 +740,540 @@ Example Qdrant payload:
 }
 ```
 
-### 5.5.2 Payload Indexes
+### 6.4 SQLite Concurrency Model
 
-Create payload indexes for:
-
-- `project`
-- `date`
-- `memory_type`
-- `session_id`
-- `tags`
-- `status`
+- WAL mode (with fallback per `hermes_state.apply_wal_with_fallback`).
+- Plugin is the only writer for capture (per Hermes process).
+- Gateway is the only writer for dreamer / migration / reindex.
+- Both can read concurrently (WAL allows it).
+- Where the gateway and plugin might race (e.g. plugin writes a fact while dreamer is reindexing): the dreamer takes an advisory write lock in `audit_log` (row-level marker) at batch start; the plugin checks before bulk-writing.
 
 ---
 
-## 5.6 Local Embedding Service
+## 7. Capture Path Details
 
-Options:
+### 7.1 Redaction Guard (Phase 1)
 
-- Ollama embeddings
-- LM Studio embedding endpoint
-- sentence-transformers local model
-- llama.cpp embedding server
+`hermes_memory_core.write.redaction`:
 
-Recommended MVP:
+```python
+PATTERNS = {
+  "aws_access_key":   r"AKIA[0-9A-Z]{16}",
+  "aws_secret":       r"(?<![A-Za-z0-9])[A-Za-z0-9+/]{40}(?![A-Za-z0-9/+])",  # heuristic
+  "github_token":     r"gh[pousr]_[A-Za-z0-9_]{36,}",
+  "openai_key":       r"sk-[A-Za-z0-9-_]{20,}",
+  "anthropic_key":    r"sk-ant-[A-Za-z0-9-_]{20,}",
+  "private_key":      r"-----BEGIN [A-Z ]+PRIVATE KEY-----",
+  "high_entropy":     r"(?<![A-Za-z0-9])[A-Za-z0-9]{40,}(?![A-Za-z0-9])",  # secondary
+  "luhn_card":        custom_luhn_match(),
+  "ssn":              r"\b\d{3}-\d{2}-\d{4}\b",
+}
 
-- Use a local embedding model that is fast and small.
-- Store embedding model name and dimensions in config.
-- Use one embedding model consistently per collection unless collections are versioned.
-
-Config:
-
-```yaml
-embedding:
-  provider: "local"
-  endpoint: "http://127.0.0.1:11434"
-  model: "nomic-embed-text"
-  dimension: 768
+def scan(content: str) -> tuple[str, list[str]]:
+    """Returns (redacted_content, types_redacted)."""
 ```
 
----
+On match: substring replaced with `[REDACTED:<type>]`; original is **never persisted**. Audit-log row records `target_id` (event_id) + types redacted + length, never the value. `force_no_redact=true` on `memory_write` skips the scan but logs an `audit_log` row of type `redaction_override` with `actor` and full context for review.
 
-## 5.7 Local LLM Summarizer / Dreamer Model
+### 7.2 Chunking (Phase 3)
 
-Use local model endpoint through LM Studio, Ollama, or another OpenAI-compatible local server.
+Default strategy:
+- Window size: 512 tokens (tokenized via tiktoken `cl100k_base` for cross-model compatibility).
+- Overlap: 128 tokens.
+- Boundary preference: turn-aligned (don't split mid-turn unless turn > 512).
+- Multi-turn tool sequences (user → assistant → tool → assistant): treat as one chunk if combined ≤ 1024 tokens, else split tool-result into its own chunk.
 
-Recommended model roles:
+Configurable in `memory.yaml`:
+```yaml
+chunking:
+  size_tokens: 512
+  overlap_tokens: 128
+  prefer_turn_boundaries: true
+  tool_sequence_max_tokens: 1024
+```
+
+### 7.3 Tool Call Source Refs (Fix from v0.1 Critique)
+
+Tool calls within a turn get their own resolvable source refs:
 
 ```text
-fast_model:
-  - chunk labeling
-  - tag extraction
-  - simple summaries
-
-strong_model:
-  - daily dream
-  - fact extraction
-  - contradiction detection
-  - project memory rewrite
+session:{session_id}#turn={turn_id}#tool={tool_call_id}
 ```
 
-Example config:
+The source resolver returns the specific `tool_calls[i]` object from the JSONL entry, including args and result.
+
+---
+
+## 8. Hybrid Retrieval
+
+### 8.1 Scoring (lifted + extended from holographic `retrieval.py`)
+
+```python
+relevance = (W_FTS    * fts_normalized
+           + W_QDRANT * qdrant_cosine
+           + W_JACCARD* jaccard_sim
+           + W_HRR    * hrr_sim)
+
+score = relevance * trust_score * freshness_decay(updated_at)
+
+# freshness_decay (configurable half-life)
+def freshness_decay(ts, half_life_days=90):
+    age_days = (now - ts).days
+    return 0.5 ** (age_days / half_life_days) if half_life_days else 1.0
+```
+
+Default weights (sum to 1.0):
+
+| Backend | Default | Notes |
+|---|---|---|
+| FTS | 0.30 | Exact strings |
+| Qdrant | 0.40 | Semantic |
+| Jaccard | 0.15 | Cheap token overlap |
+| HRR | 0.15 | Structural reasoning |
+
+Mode-driven overrides:
+
+| Mode | FTS | Qdrant | Jaccard | HRR |
+|---|---|---|---|---|
+| `keyword` | 0.70 | 0.10 | 0.20 | 0.00 |
+| `semantic` | 0.05 | 0.80 | 0.10 | 0.05 |
+| `hybrid` (default) | 0.30 | 0.40 | 0.15 | 0.15 |
+| `facts_only` | 0.40 | 0.30 | 0.15 | 0.15 (over facts table only) |
+
+### 8.2 Graceful Degradation
+
+```python
+if not qdrant_available():
+    redistribute_weight("qdrant", into=("fts","jaccard"))
+if not embed_available():
+    redistribute_weight("qdrant", into=("fts","jaccard"))  # can't embed query
+if not numpy_available():
+    redistribute_weight("hrr", into=("fts","jaccard"))
+```
+
+If all four backends are dead, return error `{degraded_modes: [...], message: ...}`.
+
+### 8.3 Deduplication
+
+Merge by `(memory_id, source_ref, content_hash)`. When duplicates collapse, union their `backend_hits` arrays so the caller sees that multiple backends agreed.
+
+---
+
+## 9. Narrative Thread (with `/new` fix)
+
+### 9.1 File Format
+
+Same as current holographic plugin: per-session `~/.hermes/SESSION-THREAD/{session_id}.md` with rolling 5-exchange window, focus line, tools list, last-updated timestamp.
+
+### 9.2 `/new` Injection Bug — Root Cause + Fix
+
+**Root cause (confirmed via Hermes source):** `_build_system_prompt` (run_agent.py §5810) caches the assembled prompt in `_cached_system_prompt` and only invalidates on context compression (`_invalidate_system_prompt()` line 10305). `/new` rotates `session_id` and fires `on_session_switch(reset=False, parent_session_id=old_id)` but the cached system prompt is **not** rebuilt — so even though the holographic plugin correctly populates `_nt_prev_content`, `system_prompt_block()` never gets called again to inject it.
+
+**v0.2 fix — Option C (user-message injection):**
+
+In `on_session_switch(new_id, parent_session_id, reset=False)`:
+
+1. Read `~/.hermes/SESSION-THREAD/{parent_session_id}.md`.
+2. Construct an injection message:
+
+```python
+injected = {
+    "role": "user",
+    "content": (
+        "[NARRATIVE THREAD — prior session context]\n\n"
+        + prior_thread_content
+        + "\n\n[end narrative thread]\n\n"
+        "Briefly note what you found above from the last session — what was the focus, "
+        "what were we working on — and ask if there's anything to pick up on or continue from there."
+    ),
+    "_hermes_local_memory_thread_inject": True,  # marker so we don't double-inject
+}
+```
+
+3. **Prepend this message** to the agent's `conversation_history` BEFORE the next user turn fires:
+   - Plugin holds reference to `AIAgent` via `initialize()` kwarg `agent_ref` (we add this — see §15.1).
+   - On `on_session_switch`, plugin calls `agent_ref.conversation_history.insert(0, injected)`.
+4. Mark `_nt_first_turn_done = True` immediately (no risk of double-injection).
+5. New session's first response naturally acknowledges prior context — no system-prompt rebuild needed, no cache invalidation needed, prompt-cache stays warm.
+
+### 9.3 Edge Cases
+
+- `parent_session_id` empty (rare — first-ever session, or branch without parent): no injection.
+- Thread file missing: no injection, log debug.
+- Context compaction mid-injection: the injected user message is part of conversation_history → gets included in compression naturally → no special handling needed.
+- `/reset` (reset=True): flush all thread state, no injection.
+
+### 9.4 Integration Test
+
+`tests/integration/test_narrative_thread_inject.py` (we own this):
+
+```text
+1. Start CLI session, send 3 turns about "Project Foo".
+2. /quit
+3. Restart CLI, /resume <previous session>
+4. Send turn: "hi"
+5. Assert: response contains 'Project Foo' OR mentions the prior focus
+6. /new
+7. Send turn: "hi again"
+8. Assert: response contains some reference to the prior session
+9. Repeat for /branch and post-compaction scenarios
+```
+
+---
+
+## 10. Dreaming v1
+
+### 10.1 Stages
+
+```text
+1. Load unprocessed turns (dream_status='pending' or post-last-checkpoint).
+2. Group by (session_id, day, project, entity).
+3. Per group:
+   3a. Generate session summary via Qwen3.6-35B (prompts/summarize_session.md).
+   3b. Extract candidate facts (prompts/extract_facts.md, JSON output enforced).
+   3c. Extract candidate decisions.
+   3d. Extract open questions.
+4. Per candidate:
+   4a. Redaction (defense in depth).
+   4b. Contradiction check (heuristic v1 — see §10.3).
+   4c. Write via memory_core.write.pipeline.write_memory().
+5. Update daily memory file.
+6. Update project memory files.
+7. Refresh indexes (chunks + FTS + Qdrant).
+8. Write dream report.
+9. Update checkpoints + mark turns dream_status='dreamed'.
+```
+
+### 10.2 Prompt Templates
+
+All under `~/.hermes/memory/prompts/`:
+
+- `summarize_session.md` — produces concise session summary + topic list.
+- `extract_facts.md` — JSON-out: `[{text, scope, project, entity?, confidence, source_ref, tags}]`.
+- `extract_decisions.md` — JSON-out: `[{text, rationale, project, source_ref, owner?}]`.
+- `extract_open_questions.md` — JSON-out: `[{text, project, priority, source_ref}]`.
+- `detect_contradictions.md` — gets two candidate facts + existing fact, returns `{verdict: confirms|contradicts|unrelated|supersedes, rationale}`.
+- `update_project_memory.md` — given existing project memory + new facts/decisions, return updated markdown.
+
+Each prompt MUST:
+- Forbid inventing unsupported facts.
+- Require source refs on every output item.
+- Specify strict JSON schema (no free text).
+
+### 10.3 Contradiction Detection (heuristic v1)
+
+```python
+def find_conflicts(candidate, existing_facts):
+    bucket = (candidate.project, candidate.entity or extract_primary_entity(candidate.text), candidate.category)
+    for existing in existing_facts in same bucket:
+        if jaccard(candidate.text_tokens, existing.text_tokens) > 0.4 and \
+           not token_alignment(candidate, existing):
+            yield existing  # potential conflict
+```
+
+On conflict: new fact gets `status='disputed'`, `supersedes_fact_id=existing.fact_id` (only as a candidate link, not auto-applied), and the dream report flags it. LLM-based semantic contradiction is post-MVP.
+
+### 10.4 Idempotency
+
+- `dream_runs` table records `(scope, started_at, processed_turn_id_range)`.
+- A re-run of the same scope: detects already-dreamed turns via `turns.dream_status='dreamed'`, skips them.
+- Fact dedup: `facts.content_hash UNIQUE` constraint blocks re-insertion; matching hash bumps `last_confirmed_at` instead.
+
+### 10.5 LLM Configuration
 
 ```yaml
 llm:
   provider: "openai-compatible"
-  base_url: "http://127.0.0.1:1234/v1"
-  dream_model: "local-strong-model"
-  fast_model: "local-small-model"
+  base_url: "http://192.168.2.105:1234/v1"
+  dream_model: "qwen3.6-35b-instruct"   # or whatever LMS reports
   temperature: 0.1
+  max_tokens: 4096
+  json_mode: true                       # strict JSON output for extraction prompts
 ```
 
 ---
 
-## 5.8 Dreamer / Consolidator
+## 11. Configuration
 
-The Dreamer is a scheduled or manually triggered process.
-
-Implementation:
-
-- Python worker
-- CLI command
-- optional cron/systemd timer
-- optional Docker service
-
-Commands:
-
-```bash
-memory dream --date 2026-05-17
-memory dream --since-last
-memory dream --project hermes
-memory dream --deep --project hermes
-```
-
-### 5.8.1 Dreamer Stages
-
-```text
-Stage 1: Load unprocessed source turns
-Stage 2: Group by session/day/project/topic
-Stage 3: Generate session summary
-Stage 4: Extract candidate facts
-Stage 5: Extract candidate decisions
-Stage 6: Extract open questions
-Stage 7: Compare candidates to existing memory
-Stage 8: Detect contradictions/supersessions
-Stage 9: Write structured DB records
-Stage 10: Update Markdown/QMD memory files
-Stage 11: Reindex derived memory
-Stage 12: Write dream report
-```
-
-### 5.8.2 Dreamer Prompts
-
-Prompt templates should be stored locally:
-
-```text
-memory/prompts/
-  summarize_session.md
-  summarize_day.md
-  extract_facts.md
-  extract_decisions.md
-  extract_open_questions.md
-  detect_contradictions.md
-  update_project_memory.md
-```
-
-### 5.8.3 Contradiction Detection
-
-The Dreamer should compare candidate facts against existing facts in the same project/entity scope.
-
-Outcomes:
-
-- create new fact
-- confirm existing fact
-- update last confirmed date
-- mark existing fact superseded
-- mark conflict as disputed
-- request user review
-
----
-
-## 5.9 Mem0 OSS Optional Layer
-
-Mem0 OSS can be added as a local memory API layer, but it must not become the only source of truth.
-
-Use cases:
-
-- adaptive memory API
-- cross-application memory access
-- optional dashboard
-- memory add/search/update abstraction
-
-Mem0 OSS can run locally as a library or self-hosted server with dashboard, API keys, and audit logging.
-
-Recommended integration pattern:
-
-```text
-Hermes
-  |
-  v
-Local Memory Gateway
-  |
-  +--> native files/SQLite/Qdrant source of truth
-  |
-  +--> optional Mem0 OSS mirror
-```
-
-Rules:
-
-1. Raw JSONL/QMD remains source of truth.
-2. Facts/decisions remain in local DB and Markdown.
-3. Mem0 stores a mirrored/adaptive memory view.
-4. If Mem0 is unavailable, core memory still works.
-5. Mem0 write operations are logged and traceable.
-
----
-
-## 5.10 Optional Graph Memory
-
-Post-MVP graph memory can be added for relationship and time-evolution queries.
-
-Options:
-
-- Kùzu
-- Neo4j
-- Graphiti-style temporal graph
-
-Graph concepts:
-
-```text
-Nodes:
-  User
-  Project
-  Agent
-  Tool
-  Model
-  Hardware
-  Vendor
-  Decision
-  Fact
-  Session
-  Document
-
-Edges:
-  USER_PREFERS
-  PROJECT_USES
-  DECISION_AFFECTS
-  FACT_SUPERSEDES
-  SESSION_DISCUSSes
-  TOOL_INTEGRATES_WITH
-  HARDWARE_RUNS_MODEL
-```
-
-Graph flow:
-
-```text
-Dreamer extracts entities/relations
-    |
-    v
-Graph writer upserts nodes/edges
-    |
-    v
-Graph search tool answers relationship/time queries
-```
-
----
-
-## 6. Tool Interface Design
-
-### 6.1 `memory_search_semantic`
-
-Input:
-
-```json
-{
-  "query": "what did we decide about Hermes memory?",
-  "project": "hermes",
-  "date_from": null,
-  "date_to": null,
-  "limit": 8
-}
-```
-
-Output:
-
-```json
-{
-  "results": [
-    {
-      "source_ref": "session:sess_20260517_hermes_001#turns=4-9",
-      "score": 0.87,
-      "memory_type": "turn_chunk",
-      "project": "hermes",
-      "excerpt": "The user prefers a local solution..."
-    }
-  ]
-}
-```
-
----
-
-### 6.2 `memory_search_keyword`
-
-Input:
-
-```json
-{
-  "query": "agents.list.0.tools",
-  "project": "openclaw",
-  "limit": 10
-}
-```
-
-Output includes exact matches and source references.
-
----
-
-### 6.3 `memory_search_hybrid`
-
-Input:
-
-```json
-{
-  "query": "local memory system like lossless claw",
-  "project": "hermes",
-  "mode": "balanced",
-  "limit": 10
-}
-```
-
-Modes:
-
-```text
-keyword_heavy
-semantic_heavy
-balanced
-recent
-facts_only
-decisions_only
-```
-
----
-
-### 6.4 `memory_add_fact`
-
-Input:
-
-```json
-{
-  "fact_text": "User prefers local/no-additional-cost memory solutions over token-metered cloud memory.",
-  "scope": "user",
-  "project": "hermes",
-  "source_ref": "session:sess_20260517_hermes_001#turn=7",
-  "confidence": 0.95,
-  "tags": ["preference", "local-first", "cost"]
-}
-```
-
----
-
-### 6.5 `memory_dream_now`
-
-Input:
-
-```json
-{
-  "scope": "since_last",
-  "project": null,
-  "deep": false
-}
-```
-
-Output:
-
-```json
-{
-  "dream_run_id": "dream_20260517_230000",
-  "status": "completed",
-  "report_path": "memory/dreams/2026/2026-05-17-2300.md",
-  "facts_created": 4,
-  "decisions_created": 2,
-  "questions_created": 3
-}
-```
-
----
-
-## 7. Source Reference Format
-
-Use stable source refs:
-
-```text
-session:{session_id}#turn={turn_id}
-session:{session_id}#turns={start}-{end}
-daily:{YYYY-MM-DD}
-project:{project}/memory.md#section={heading}
-fact:{fact_id}
-decision:{decision_id}
-question:{question_id}
-```
-
-Examples:
-
-```text
-session:sess_20260517_hermes_001#turns=6-9
-project:hermes/memory.md#section=Architecture Decisions
-fact:fact_20260517_000003
-```
-
----
-
-## 8. Configuration
-
-Main config file:
-
-```text
-memory/config/memory.yaml
-```
-
-Example:
+### 11.1 Plugin Config (in `~/.hermes/config.yaml`)
 
 ```yaml
-paths:
-  base: "~/ai-memory/hermes-local-memory"
-  raw: "memory/raw"
-  qmd: "memory/qmd"
-  daily: "memory/daily"
-  projects: "memory/projects"
-  dreams: "memory/dreams"
-  sqlite: "memory/index/memory.sqlite"
-
-services:
-  gateway:
-    host: "127.0.0.1"
-    port: 8787
-
-  qdrant:
-    url: "http://127.0.0.1:6333"
-
-embedding:
-  provider: "ollama"
-  endpoint: "http://127.0.0.1:11434"
-  model: "nomic-embed-text"
-
-llm:
-  provider: "openai-compatible"
-  base_url: "http://127.0.0.1:1234/v1"
-  fast_model: "local-small"
-  dream_model: "local-strong"
-  temperature: 0.1
-
 memory:
-  default_project: "general"
-  redact_secrets: true
-  write_qmd: true
-  write_daily: true
-  write_project_memory: true
+  provider: hermes-local                   # the swap
 
-dreamer:
-  schedule: "nightly"
-  max_turns_per_batch: 500
-  require_source_refs: true
-  contradiction_detection: true
-  auto_promote_confidence_threshold: 0.85
-
-mem0:
-  enabled: false
-  mode: "self-hosted"
-  endpoint: "http://127.0.0.1:8888"
+plugins:
+  hermes-local-memory:
+    base_path: "$HERMES_HOME/memory"
+    sqlite_path: "$HERMES_HOME/memory/index/memory.sqlite"
+    gateway:
+      enabled: true
+      url: "http://127.0.0.1:8787"
+      timeout_ms: 8000
+      fallback_to_inprocess: true          # if gateway down, call core directly
+    redaction:
+      enabled: true
+      log_overrides: true
+    embedding:
+      provider: "openai-compatible"
+      endpoint: "http://192.168.2.105:1235/v1"
+      model: "text-embedding-nomic-embed-text-v1.5"
+      dimension: 768
+    dreamer:
+      enabled: true
+      cadence: "nightly"                   # 'nightly','session_end','manual_only','all'
+      cron_time: "03:00"
+      llm_endpoint: "http://192.168.2.105:1234/v1"
+      llm_model: "qwen3.6-35b-instruct"
+      max_turns_per_batch: 500
+      auto_promote_confidence: 0.8
+    narrative_thread:
+      enabled: true
+      thread_dir: "$HERMES_HOME/SESSION-THREAD"
+      retention_days: 30
+    hybrid_weights:
+      fts: 0.30
+      qdrant: 0.40
+      jaccard: 0.15
+      hrr: 0.15
+    freshness_half_life_days: 90
 ```
+
+### 11.2 Gateway Service Config (`~/.hermes/memory/config/memory.yaml`)
+
+Same shape; the gateway reads its own config so it can run standalone (e.g., headless on a server).
 
 ---
 
-## 9. Deployment Architecture
+## 12. Deployment
 
-### 9.1 MVP Local Deployment
+### 12.1 Plugin
+
+Ships inside `hermes-agent` via `plugins/memory/hermes-local/`. No separate install — Hermes plugin loader picks it up. Activation = one config line.
+
+### 12.2 Gateway
+
+Standalone systemd unit (`hermes-memory-gateway.service`) under `~/.hermes/memory/scripts/`:
+
+```ini
+[Unit]
+Description=Hermes Local Memory Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=dmccarty
+WorkingDirectory=/home/dmccarty/.hermes/hermes-agent
+ExecStart=/home/dmccarty/.hermes/hermes-agent/venv/bin/python -m hermes_memory_gateway
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 12.3 Dreamer
+
+systemd timer (`hermes-memory-dream.timer`) fires nightly at 3am, runs `hermes-memory-dream.service`, which invokes `python -m hermes_memory_core.dream --scope since_last`.
+
+### 12.4 Docker (optional / future)
+
+Compose file provided for headless/server-only deployments. Out-of-scope for MVP on the main lab machine since Qdrant + LMS are already running natively.
+
+---
+
+## 13. Security & Privacy
+
+- Phase 1 redaction (see §7.1).
+- All memory local by default.
+- Audit log on every write + every redaction override.
+- High-risk content (financial/medical/legal/credentials) flagged via tag-based heuristic; high-risk writes require `force_no_redact=true` or hit redaction.
+- Post-MVP: memory review queue for low-confidence + sensitive items.
+
+---
+
+## 14. Reliability
+
+### 14.1 Idempotency
+
+- Event hashing: `sha256(session_id + turn_id + raw_content)` keys dedup.
+- Chunk IDs: deterministic from `(session_id, start_turn_id, end_turn_id, text_hash, embed_model)`.
+- Dream runs: tagged by `(scope, started_at)`; reruns skip already-processed turns.
+- Fact writes: `facts.content_hash UNIQUE` blocks dupes; matching hash bumps `last_confirmed_at`.
+
+### 14.2 Recovery
+
+`memory rebuild-indexes` performs:
+
+1. Drop `chunks_fts`, `turns_fts`, `facts_fts`, `decisions_fts`.
+2. Delete Qdrant collections (or recreate with current embed model version).
+3. Re-scan all JSONL files in `raw/` → re-insert turns (idempotent via content_hash).
+4. Re-chunk all turns → insert into chunks → re-embed → upsert Qdrant.
+5. Optionally re-run dreamer to rebuild facts/decisions/questions from raw.
+
+Raw JSONL is never touched during rebuild.
+
+### 14.3 Checkpoints
+
+`dream_runs` rows + `turns.dream_status` + `turns.index_status` are the durable checkpoints. A crashed dream run leaves status `running` — next dreamer detects stale `running` rows, marks them `failed`, and retries from the last completed checkpoint.
+
+---
+
+## 15. Hermes Integration Details
+
+### 15.1 New `MemoryProvider` Capability We Need
+
+To inject the narrative-thread user message (§9.2), the plugin needs a reference to the `AIAgent`'s `conversation_history`. The existing ABC doesn't pass this. Two options:
+
+**Option A — extend `MemoryProvider.initialize` kwargs (preferred, no core change):**
+
+The existing `initialize(session_id, **kwargs)` already passes `hermes_home`, `platform`, etc. We add a check: if `kwargs.get('agent_ref')` is available, store it. If not, fall back to a `system_prompt_block`-with-cache-invalidation hack (call `agent._invalidate_system_prompt()` via reflection — fragile).
+
+**Option B — submit a small upstream PR to Hermes:**
+
+Add `agent_ref` to the documented `initialize` kwargs. Tiny change, no breaking impact (extra kwarg, backwards compatible).
+
+Recommendation: **try Option A via reflection first** (zero coupling), if it doesn't work reliably, raise Option B as a small PR.
+
+### 15.2 Hooks We Implement
+
+| Hook | Why |
+|---|---|
+| `initialize(session_id, **kwargs)` | Open DB, connect Qdrant, store agent ref, set up worker thread |
+| `is_available()` | `True` (local, no creds needed) |
+| `system_prompt_block()` | Pinned facts + active project context (small, not the narrative thread) |
+| `prefetch(query, session_id)` | Return cached hybrid prefetch result |
+| `queue_prefetch(query, session_id)` | Background thread runs hybrid search for next turn |
+| `sync_turn(user, asst, session_id)` | Main capture path |
+| `get_tool_schemas()` | The 7 schemas in §5.2 |
+| `handle_tool_call()` | Dispatch to core |
+| `on_session_end(messages)` | Optional dream trigger; flush async writes |
+| **`on_session_switch(new_id, parent, reset)`** | **Narrative-thread injection (fix)** |
+| `on_pre_compress(messages)` | Extract candidate facts BEFORE Hermes discards |
+| `on_memory_write(action, target, content, metadata)` | Mirror built-in `memory` tool writes as facts |
+| `on_delegation(task, result, child_session_id)` | Capture subagent outputs as turns |
+| `get_config_schema()` | Wire into `hermes memory setup` |
+| `save_config(values, hermes_home)` | Write into `config.yaml` |
+| `shutdown()` | Close DB, flush queues |
+
+---
+
+## 16. Migration from Holographic
+
+`scripts/migrate_from_holographic.py`:
+
+```python
+1. Read ~/.hermes/memory_store.db (via SQLite, read-only).
+2. For each row in holographic.facts:
+   - Map: content -> fact_text
+          category -> category
+          tags -> tags_json
+          trust_score -> trust_score
+          retrieval_count -> retrieval_count
+          helpful_count -> helpful_count
+          created_at/updated_at -> created_at/updated_at
+   - source_ref = "migration:holographic#fact_id={old_id}"
+   - confidence = trust_score (initial pin)
+   - Call memory_core.write.pipeline.write_memory(fact, skip_redaction=False)
+     (force_no_redact NOT set — secrets that snuck in earlier still get caught now)
+3. Holographic entities + fact_entities -> new entities + fact_entities (preserve IDs).
+4. Holographic memory_banks -> recomputed via rebuild_all_vectors() (fresh).
+5. Write a migration report to memory/exports/migration-holographic-{ts}.md.
+6. Do NOT touch holographic memory_store.db. (User can flip provider back any time.)
+```
+
+Idempotent — re-running detects existing facts by content_hash and skips them. User flips `memory.provider: hermes-local` only after running migration + verifying counts.
+
+---
+
+## 17. Observability
+
+### 17.1 Logs
 
 ```text
-Host machine or AI lab node
-  |
-  +-- memory-gateway container
-  +-- qdrant container
-  +-- optional mem0-oss container
-  +-- sqlite file volume
-  +-- memory file volume
-  +-- local model server
+~/.hermes/logs/memory-plugin.log     (capture path, plugin lifecycle)
+~/.hermes/logs/memory-gateway.log    (gateway service)
+~/.hermes/logs/memory-dream.log      (dreamer runs)
+~/.hermes/memory/audit.jsonl         (write-events + redactions + overrides)
 ```
 
-### 9.2 Docker Compose Sketch
-
-```yaml
-services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
-    volumes:
-      - ./data/qdrant:/qdrant/storage
-
-  memory-gateway:
-    build: ./memory-gateway
-    ports:
-      - "8787:8787"
-    volumes:
-      - ./memory:/app/memory
-    environment:
-      - MEMORY_CONFIG=/app/memory/config/memory.yaml
-    depends_on:
-      - qdrant
-```
-
-Mem0 OSS can be added later.
-
----
-
-## 10. Security and Privacy Design
-
-### 10.1 Local-First Rule
-
-No external API calls by default.
-
-### 10.2 Secret Redaction
-
-Redaction guard should detect:
-
-- API keys
-- tokens
-- passwords
-- private keys
-- OAuth secrets
-- credit card-like strings
-- SSNs
-- bank account-like strings
-
-### 10.3 Memory Write Guard
-
-High-risk memory writes require review:
-
-- credentials
-- precise personal addresses
-- medical facts
-- financial account details
-- legal claims
-- highly sensitive personal attributes
-
-### 10.4 Audit Trail
-
-Every memory mutation logs:
-
-- actor
-- timestamp
-- previous value
-- new value
-- source refs
-- reason
-- confidence
-
----
-
-## 11. Reliability Design
-
-### 11.1 Idempotent Capture
-
-Events are hashed. Duplicate events are ignored or linked.
-
-### 11.2 Idempotent Indexing
-
-Chunk IDs are deterministic from session/turn ranges and content hash.
-
-### 11.3 Dream Checkpoints
-
-Each dream run records:
-
-- input sessions
-- input turn ranges
-- status
-- output paths
-- error log
-
-### 11.4 Recovery
-
-Recovery steps:
-
-1. Rebuild SQLite from raw JSONL.
-2. Rebuild QMD from SQLite/raw.
-3. Rebuild Qdrant from chunks.
-4. Rerun dreams from checkpoint or full source.
-
----
-
-## 12. Observability
-
-### 12.1 Logs
-
-Log files:
+### 17.2 Metrics (basic — gauge files, not Prometheus for MVP)
 
 ```text
-logs/memory-gateway.log
-logs/indexer.log
-logs/dreamer.log
-logs/errors.log
+~/.hermes/memory/metrics.json   updated by plugin + gateway:
+  {
+    captured_turns_24h: 142,
+    chunks_indexed_24h: 67,
+    chunks_pending: 3,
+    facts_total: 51, facts_active: 47,
+    qdrant_points: 1248,
+    last_dream_run_at: "2026-05-17T03:00:00",
+    last_dream_status: "completed",
+    redactions_24h: 2
+  }
 ```
 
-### 12.2 Health Checks
+Wire into the existing observability stack (`/disk2/observability`) post-MVP.
 
-Endpoints:
+### 17.3 Health Endpoints (gateway)
 
-```text
-GET /health
-GET /health/sqlite
-GET /health/qdrant
-GET /health/embedding
-GET /health/llm
-```
-
-### 12.3 Metrics
-
-Track:
-
-- captured turns
-- indexed chunks
-- failed indexing records
-- dream run duration
-- facts created
-- contradictions detected
-- search latency
-- Qdrant collection sizes
-- SQLite DB size
+`GET /health` returns rolled-up status of: SQLite, Qdrant, embedding endpoint, dreamer LLM, dreamer last-run age, disk space.
 
 ---
 
-## 13. Build Sequencing
+## 18. Testing Strategy
 
-Recommended build order:
+### 18.1 Unit Tests
 
-1. Filesystem layout and config.
-2. SQLite schema.
-3. Capture manager.
-4. QMD exporter.
-5. Keyword search.
-6. Qdrant integration.
-7. Semantic search.
-8. Hybrid search.
-9. Dreamer v1.
-10. Hermes tool bridge.
-11. Memory file updater.
-12. Optional Mem0 OSS mirror.
-13. Optional graph memory.
+- Event hashing, dedup
+- JSONL append + read-back
+- SQLite migrations are idempotent
+- FTS triggers fire on insert/update/delete
+- Redaction patterns (positive + negative)
+- Chunker boundaries
+- Hybrid scorer weight redistribution
+- Source ref parser (all formats)
+- HRR encode/bundle/probe (forked from holographic)
+- Fact contradiction heuristic
 
----
+### 18.2 Integration Tests
 
-## 14. Testing Strategy
+- capture → SQLite → QMD → FTS visible
+- capture → chunk → embed → Qdrant
+- hybrid search returns merged source-refs
+- dreamer produces daily + project memory + dream report
+- `memory_write` round-trips via plugin and gateway
+- `memory_get_source` resolves all ref formats
+- **Narrative thread `/new` injection (the bug-fix test)** — covers `/resume`, `/branch`, `/new`, post-compaction
+- Provider swap removes holographic tools from registered schemas
+- Migration from holographic preserves all facts (count + content_hash)
+- Graceful degradation: kill Qdrant; hybrid still returns FTS results
+- Rebuild-indexes recreates correct row counts from raw
 
-### 14.1 Unit Tests
+### 18.3 Acceptance Tests (MVP gate)
 
-- ID generation
-- JSONL append
-- SQLite inserts
-- FTS indexing
-- chunking
-- source ref creation
-- redaction
-- fact dedupe
+Mapped to `Plan.md §13`. Headline scenario:
 
-### 14.2 Integration Tests
-
-- capture → SQLite → QMD
-- capture → chunk → FTS
-- capture → chunk → embedding → Qdrant
-- search hybrid returns source refs
-- dreamer updates files
-- Hermes tool call returns valid JSON
-
-### 14.3 Regression Tests
-
-Use a fixture session containing:
-
-- exact error string
-- conceptual memory discussion
-- decision
-- contradictory fact
-- open question
-- sensitive secret-like value
-
-### 14.4 Acceptance Tests
-
-User queries:
-
-1. “Find the exact error about `agents.list.0.tools`.”
-2. “What did we decide about Honcho?”
-3. “What is my local memory architecture?”
-4. “Show open questions for Hermes memory.”
-5. “Dream today’s conversations and update project memory.”
+> Seed a session with 10 turns including an exact error string, a conceptual discussion, a decision, a contradiction, and a fixture API key. After capture: API key is redacted, keyword search finds error string, semantic search finds conceptual discussion, dreamer extracts the decision with source ref, contradiction is flagged not silently overwritten. `/new`, then "hi" — assistant references prior session.
 
 ---
 
-## 15. Future Enhancements
+## 19. Out-of-Scope (Reaffirmed)
 
-1. Web dashboard.
-2. Graph memory.
-3. Meeting transcript ingestion.
-4. Document ingestion from NAS.
-5. OpenClaw bridge.
-6. Agent Zero bridge.
-7. Local reranker.
-8. User review queue.
-9. Memory diff viewer.
-10. Export/import pack format.
+- Cloud sync, multi-user governance, per-user memory partitions
+- Real-time graph reasoning (post-MVP)
+- Document/file ingestion beyond chat turns
+- Web dashboard
+- Cross-agent memory bus formalization (OpenClaw / Agent Zero coexist; no shared store in MVP)
 
 ---
 
-## 16. References
+## 20. References
 
-- Hermes Agent memory providers: https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/memory-providers.md
-- Hermes Honcho memory overview: https://hermes-agent.nousresearch.com/docs/user-guide/features/honcho
-- Mem0 OSS overview: https://docs.mem0.ai/open-source/overview
-- Mem0 self-hosted setup: https://docs.mem0.ai/open-source/setup
-- Qdrant collections: https://qdrant.tech/documentation/manage-data/collections/
-- Qdrant payload filtering: https://qdrant.tech/documentation/search/filtering/
-- Qdrant payload indexing: https://qdrant.tech/documentation/manage-data/payload/
-- SQLite: https://sqlite.org/
+- Hermes `MemoryProvider` ABC: `~/.hermes/hermes-agent/agent/memory_provider.py`
+- Holographic plugin (primary reference): `~/.hermes/hermes-agent/plugins/memory/holographic/`
+- Honcho plugin (out-of-process reference): `~/.hermes/hermes-agent/plugins/memory/honcho/`
+- OpenClaw enhanced-memory: `~/.openclaw/workspace/skills/enhanced-memory/README.md`
+- Hermes session-state helper: `~/.hermes/hermes-agent/hermes_state.py` (`apply_wal_with_fallback`)
+- Qdrant: https://qdrant.tech/documentation/
+- SQLite FTS5: https://sqlite.org/fts5.html
+- nomic-embed-text-v1.5: https://huggingface.co/nomic-ai/nomic-embed-text-v1.5
+- v0.1 docs: `docs/archive/v0.1-original/`
