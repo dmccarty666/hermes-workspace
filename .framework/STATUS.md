@@ -328,3 +328,230 @@ When the hermes-memory Phase 6 gate is approved and you come back to this:
 ---
 
 **Maintain this doc.** Whenever you make a structural change, update §3 (state on disk) and §5 (tasklist). Whenever you make an irreversible decision, append to §7.
+
+---
+
+## §10 Toolchain — Skills, MCPs, and CLI Tools
+
+> Installed 2026-05-21 as part of worker quality initiative. All tools verified
+> working on 2026-05-21. Cargo/Rust installed for Rust-based tools.
+
+### CLI Tools (installed system-wide)
+
+| Tool | Version | Purpose | Users |
+|---|---|---|---|
+| `ruff` | 0.15.14 | Python lint + format (replaces black+flake8) | hm-developer, hm-qa |
+| `shellcheck` | 0.9.0 | Bash script static analysis | hm-developer, all |
+| `lychee` | 0.24.2 | Fast markdown link checker | hm-docs |
+| `yamllint` | 1.38.0 | YAML validation | hm-developer, devops |
+| `jq` | 1.7 | JSON query/filter for log parsing | all profiles |
+| `pytest-xdist` | 3.8.0 | Parallel test execution | hm-qa, hm-developer |
+| `pytest-cov` | 7.1.0 | Coverage reporting | hm-qa, hm-developer |
+| `httpie` | latest | Humane API testing CLI | hm-developer |
+| `delta` | 0.19.2 | Better git diffs (syntax highlighting) | all profiles |
+| `tokei` | 14.0.0 | LOC counter by language | hm-developer |
+
+Install path for new environments:
+```bash
+# System
+sudo apt install -y shellcheck jq
+
+# Python
+pip install --break-system-packages ruff yamllint httpie pytest-xdist pytest-cov
+
+# Rust tools (requires cargo — install first if missing)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+cargo install git-delta tokei lychee
+```
+
+### Skills to Author (per profile)
+
+#### hm-developer
+- **`git-workflow`** — branch from ticket ID, conventional commits, interactive rebase, `gh pr` workflow. Hooks: pre-commit ruff, post-commit tests. Pitfalls: force-push etiquette, detached HEAD.
+- **`code-review`** — already written in hermes-agent, attach to hm-developer profile
+- **`black-format`** → actually use `ruff format` (already installed, replaces black)
+
+#### hm-qa
+- **`diff-analysis`** — compare directory trees, JSON outputs, log diffs. Colorized unified diffs, semantic vs text diffing, regression pattern detection.
+- **`pytest-runner`** — run pytest with coverage + parallel. Parse failures, collect test counts, surface regressions. Common: `pytest tests/ -q --cov=. --cov-report=term-missing`
+- **`log-triage`** — grep/filter structured logs, find exceptions by type, stack trace extraction, time-window filtering.
+
+#### hm-docs
+- **`markdown-review`** — lint line length, heading hierarchy, link format, code block labels, image alt text. Auto-fix common issues.
+- **`link-checker`** — run lychee against all markdown files, report dead links as block.
+- **`mermaid-diagrams`** — validate mermaid syntax, render to SVG/PNG.
+
+#### hm-planner
+- **`project-bootstrap`** — create project structure from SOUL type, generate Plan.md / PRD.md / TDD.md from framework templates.
+- **`requirements-analysis`** — parse vague requests into structured requirements with acceptance criteria.
+- **`estimation`** — break work into time-boxed units, reference kanban history for effort signals.
+
+### MCP Servers to Build
+
+#### `kanban-mcp` (highest leverage — persistent stdio server)
+Persistent Python process that wraps `hermes kanban` CLI. Exposes structured tools:
+- `kanban_create(title, body, profile, tags)` → card_id
+- `kanban_move(card_id, status)` → success
+- `kanban_assign(card_id, profile)` → success
+- `kanban_block(card_id, reason)` → success
+- `kanban_unblock(card_id)` → success
+- `kanban_comment(card_id, text)` → comment_id
+- `kanban_list(status)` → list of cards
+- `kanban_child_create(parent_id, title, profile)` → child card_id (auto-links)
+
+Workers call these via `mcporter call kanban-mcp <tool> <args>` — no need to
+remember CLI syntax. Auto-creates QA child cards when dev cards move to done
+(triggered by `auto_blocked` state).
+
+**Location:** `~/.hermes/mcp-servers/kanban-mcp/`
+
+#### `git-mcp` (high leverage — persistent stdio server)
+Persistent Python process wrapping git + gh CLI. Exposes:
+- `git_branch(name, base)` → branch name
+- `git_commit(message, files)` → commit SHA
+- `git_push(branch)` → pushed
+- `git_pr_create(title, body, reviewers)` → PR URL
+- `git_pr_review(pr_url, approval)` → review submitted
+- `git_log(path, limit)` → structured log entries
+- `git_blame(path)` → per-line commit attribution
+
+Enforces: branch naming `<type>/<ticket-id>`, conventional commit format,
+linear history preference.
+
+**Location:** `~/.hermes/mcp-servers/git-mcp/`
+
+#### `test-runner-mcp` (medium — for QA)
+- `pytest_run(path, flags, coverage)` → structured results (pass/fail, duration, coverage %)
+- `pytest_parse_report(json_report)` → summary
+- `coverage_check(threshold)` → pass/fail + delta from threshold
+
+**Location:** `~/.hermes/mcp-servers/test-runner-mcp/`
+
+#### `diff-mcp` (medium — for QA + developer)
+- `diff_dirs(path_a, path_b)` → unified diff
+- `diff_json(a, b)` → structured JSON diff
+- `diff_text(before, after)` → semantic diff
+- `patch_apply(original, patch)` → patched result
+
+**Location:** `~/.hermes/mcp-servers/diff-mcp/`
+
+#### `doc-mcp` (medium — for docs)
+- `markdown_lint(file_or_dir)` → issues list with line numbers
+- `link_check(file_or_dir)` → broken link report
+- `render_mermaid(mermaid_code, format)` → SVG/PNG binary
+
+**Location:** `~/.hermes/mcp-servers/doc-mcp/`
+
+### Profile Skill Attachments (what to add to each profile)
+
+Update each profile's config.yaml to include the new skills:
+
+```yaml
+# hm-developer — add to existing skills list
+skills:
+  - kanban-worker
+  - software-development
+  - software-development:code-review
+  - software-development:test-driven-development
+  - git-workflow          # NEW
+  - black-format          # NEW (uses ruff)
+
+# hm-qa — add
+skills:
+  - kanban-worker
+  - diff-analysis         # NEW
+  - pytest-runner         # NEW
+  - log-triage            # NEW
+
+# hm-docs — add
+skills:
+  - kanban-worker
+  - markdown-review       # NEW
+  - link-checker          # NEW
+  - mermaid-diagrams      # NEW
+
+# hm-planner — add
+skills:
+  - kanban-worker
+  - project-bootstrap     # NEW
+  - requirements-analysis # NEW
+  - estimation           # NEW
+```
+
+### MCP Server Registration (config.yaml)
+
+```yaml
+mcp:
+  servers:
+    kanban:
+      command: python
+      args: ["~/.hermes/mcp-servers/kanban-mcp/server.py"]
+      env:
+        HERMES_KANBAN_DB: "~/.hermes/kanban.db"
+    git:
+      command: python
+      args: ["~/.hermes/mcp-servers/git-mcp/server.py"]
+    test-runner:
+      command: python
+      args: ["~/.hermes/mcp-servers/test-runner-mcp/server.py"]
+    diff:
+      command: python
+      args: ["~/.hermes/mcp-servers/diff-mcp/server.py"]
+    doc:
+      command: python
+      args: ["~/.hermes/mcp-servers/doc-mcp/server.py"]
+```
+
+### Verification Commands
+
+```bash
+# CLI tools
+ruff check . --output-format=concise
+yamllint .
+shellcheck scripts/**/*.sh
+lychee README.md --verbose
+tokei src/ --json | jq '.Rust'
+
+# Skill authoring check
+ls ~/.hermes/skills/git-workflow/
+ls ~/.hermes/skills/diff-analysis/
+
+# MCP server smoke test
+mcporter list
+mcporter call kanban-mcp list '{"status":"ready"}'
+```
+
+---
+
+## §11 Open Tasklist (Toolchain — F-008 onwards)
+
+> Updated 2026-05-21. CLI tools installed. Skills and MCPs remain open.
+
+| ID | Task | Effort | Priority | Depends | Status |
+|---|---|---|---|---|---|
+| **F-008** | Author `git-workflow` skill (hm-developer) | 2h | P0 | — | ⏳ pending |
+| **F-009** | Author `diff-analysis` skill (hm-qa) | 2h | P0 | — | ⏳ pending |
+| **F-010** | Author `pytest-runner` skill (hm-qa) | 1.5h | P0 | — | ⏳ pending |
+| **F-011** | Author `log-triage` skill (hm-qa) | 1.5h | P1 | F-010 | ⏳ pending |
+| **F-012** | Author `markdown-review` skill (hm-docs) | 1.5h | P1 | — | ⏳ pending |
+| **F-013** | Author `link-checker` skill (hm-docs) | 1h | P1 | F-012 | ⏳ pending |
+| **F-014** | Author `mermaid-diagrams` skill (hm-docs) | 1h | P2 | — | ⏳ pending |
+| **F-015** | Author `project-bootstrap` skill (hm-planner) | 2h | P1 | — | ⏳ pending |
+| **F-016** | Author `requirements-analysis` skill (hm-planner) | 1.5h | P2 | — | ⏳ pending |
+| **F-017** | Build `kanban-mcp` server | 4h | P0 | F-008 | ⏳ pending |
+| **F-018** | Build `git-mcp` server | 3h | P0 | F-008 | ⏳ pending |
+| **F-019** | Build `test-runner-mcp` server | 3h | P1 | F-010 | ⏳ pending |
+| **F-020** | Build `diff-mcp` server | 2h | P1 | F-009 | ⏳ pending |
+| **F-021** | Build `doc-mcp` server | 2h | P2 | F-012, F-013 | ⏳ pending |
+| **F-022** | Update all 4 profile configs with new skills | 1h | P0 | F-008–F-016 | ⏳ pending |
+| **F-023** | Register MCP servers in config.yaml | 1h | P0 | F-017–F-021 | ⏳ pending |
+| **F-024** | Dogfood: run all new skills against hermes-agent itself | 4h | P1 | F-022 | ⏳ pending |
+| **F-025** | Migrate hermes-memory onto framework (definitive test) | 6h | P1 | F-022, F-024 | ⏳ pending |
+| **F-026** | Author remaining SOUL templates (planner, architect, qa, docs) | 11.5h | P0 | F-025 | ⏳ pending |
+
+**Notes:**
+- F-008 through F-016 can run in parallel (different profiles)
+- F-017 (kanban-mcp) blocks auto-child-creation feature for QA cards
+- F-026 (remaining SOULs) is the original F-001 work — preserved from §5
+- Order to build: git-workflow → diff-analysis → pytest-runner → markdown-review → kanban-mcp → git-mcp → others
