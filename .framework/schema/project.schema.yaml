@@ -65,6 +65,12 @@ properties:
         type: string
         enum: [python, typescript, javascript, go, rust, mixed, other]
         default: python
+      primary_language_ext:
+        type: string
+        description: |
+          File extension associated with primary_language for use in
+          search_files() glob patterns. Defaults to "py" for python.
+        default: py
       test_command:
         type: string
         description: |
@@ -102,6 +108,23 @@ properties:
           Title template for the per-phase planning task. {phase} is the
           phase number.
         default: "T-PLAN-PHASE-{phase}: Decompose Phase {phase} of {project.slug}"
+      qa_gate_checklist:
+        type: array
+        description: |
+          Per-phase verification checklist consumed by qa.md.tmpl §3 GATE 4
+          ("Project-Critical Gates"). Each entry is a phase with named
+          check items. Optional — when absent, qa SOUL falls back to
+          referencing Plan.md acceptance scenarios generically.
+        items:
+          type: object
+          required: [number, name, checks]
+          additionalProperties: false
+          properties:
+            number: { type: integer, minimum: 1 }
+            name:   { type: string }
+            checks:
+              type: array
+              items: { type: string }
 
   goal:
     type: object
@@ -254,6 +277,30 @@ properties:
         type: string
         description: Where ADRs live (relative to project root)
         default: "docs/adr/"
+      repo_root:
+        type: string
+        description: |
+          Absolute path to the git repository that hosts the code under
+          source_root. Used by docs SOUL for `git log` invocations.
+      data_root:
+        type: string
+        description: |
+          Free-form text describing where the project's persistent data
+          lives (multi-line allowed — rendered verbatim into developer SOUL
+          §1 Canonical project paths).
+      additional_source_roots:
+        type: array
+        description: |
+          Extra code roots beyond `source_root` that workers may touch
+          (e.g. shared libraries, sidecar services). Rendered into
+          developer + qa SOULs §1.
+        items:
+          type: object
+          required: [path]
+          additionalProperties: false
+          properties:
+            path:  { type: string }
+            label: { type: string }
       sibling_projects:
         type: array
         description: |
@@ -273,8 +320,10 @@ properties:
   guardrails:
     type: object
     description: |
-      Project-specific "NEVER" rules for workers. These are appended to the
-      hard-blocks section of the developer + qa SOULs.
+      Project-specific "NEVER" rules and structured worker guidance. Beyond
+      the simple per-role NEVER lists, this section carries developer Quality
+      Gates, review-required categories, stop-immediately triggers, and
+      TDD-critical area names that the templates loop over.
     additionalProperties: false
     properties:
       developer:
@@ -286,6 +335,105 @@ properties:
       architect:
         type: array
         items: { type: string }
+      planner:
+        type: array
+        items: { type: string }
+      developer_gates:
+        type: array
+        description: |
+          Extra Quality Gates beyond the framework defaults (tests +
+          anti-mock + code-quality). Each gate becomes "GATE N — <name>"
+          with a list of ☐ check items. Drives developer.md.tmpl §3.
+        items:
+          type: object
+          required: [name, checks]
+          additionalProperties: false
+          properties:
+            name:   { type: string }
+            note:   { type: string }
+            checks:
+              type: array
+              items: { type: string }
+      developer_tdd_critical_areas:
+        type: array
+        description: |
+          Area names where TDD is especially strict. Rendered into the
+          opening sentence of developer.md.tmpl §4.
+        items: { type: string }
+      developer_review_required:
+        type: array
+        description: |
+          Categories of work that ALWAYS end with kanban_block(review-required)
+          instead of auto-completing. Rendered into developer.md.tmpl §7.
+        items: { type: string }
+      developer_stop_immediately:
+        type: array
+        description: |
+          STOP-IMMEDIATELY triggers in developer.md.tmpl §8 (escalation block).
+        items: { type: string }
+      qa_stop_immediately:
+        type: array
+        description: |
+          STOP-IMMEDIATELY (urgency=critical) triggers in qa.md.tmpl §8.
+        items: { type: string }
+
+  test_environment:
+    type: object
+    description: |
+      Local infrastructure available to integration tests. Drives the
+      "Anti-Mock Philosophy" sections of developer + qa SOULs. When the
+      project has no special test infra, omit this block — the templates
+      fall back to generic prose.
+    additionalProperties: false
+    properties:
+      services:
+        type: array
+        items:
+          type: object
+          required: [name, endpoint]
+          additionalProperties: false
+          properties:
+            name:         { type: string }
+            endpoint:     { type: string }
+            note:         { type: string }
+            test_pattern: { type: string }
+            health_check: { type: string }
+
+  code_quality:
+    type: object
+    description: |
+      Numeric coding-style limits referenced by developer.md.tmpl
+      (function-length cap + baby-step commit caps). Defaults come from
+      the template itself so this block is fully optional.
+    additionalProperties: false
+    properties:
+      max_function_lines:       { type: integer, minimum: 1, default: 75 }
+      commit_max_files:         { type: integer, minimum: 1, default: 3 }
+      commit_max_lines_added:   { type: integer, minimum: 1, default: 50 }
+      commit_max_lines_removed: { type: integer, minimum: 1, default: 50 }
+
+  qa_recipes:
+    type: array
+    description: |
+      Phase-specific verification recipes rendered verbatim into qa.md.tmpl
+      §6. Each recipe is a titled code block; lang defaults to bash.
+    items:
+      type: object
+      required: [title, body]
+      additionalProperties: false
+      properties:
+        title: { type: string }
+        phase: { type: integer, minimum: 1 }
+        lang:  { type: string }
+        body:  { type: string }
+
+  phase_exit_criteria_count:
+    type: integer
+    minimum: 1
+    default: 18
+    description: |
+      Number of phase-gate exit criteria the auditor verifies. Rendered
+      into auditor.md.tmpl as "run full N-point checklist".
 
   inputs:
     type: object
@@ -301,3 +449,4 @@ properties:
       plan_md:       { type: string, default: Plan.md }
       epics_md:      { type: string, default: EPICS.md }
       tasklist_md:   { type: string, default: TASKLIST.md }
+      critique_md:   { type: string, description: "Path to a critique / known-gotchas doc (optional)." }
