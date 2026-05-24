@@ -93,14 +93,22 @@ Phase numbers map 1:1 to `Plan.md`. Each epic lands a working, verifiable slice 
 
 ---
 
-## Post-MVP (Deferred — track in TASKLIST.md "Backlog")
+## Post-MVP (Deferred — see phase docs in docs/)
 
-- Mem0 OSS mirror integration
-- Graph memory (Kùzu / Neo4j)
-- Local re-ranker (e.g. mxbai-rerank)
-- Memory review queue (CLI + dashboard)
-- Cross-agent gateway hardening (OpenClaw / Agent Zero)
-- Document/transcript ingestion
-- Web dashboard
-- LLM-based contradiction detection (replaces heuristic)
-- Compression of raw JSONL after age threshold
+| Phase | Doc | Scope | Est. Lines |
+|---|---|---|---|
+| Graph memory | **`docs/GRAPH_MEMORY.md`** — master spec | Full feature overview | — |
+| **G1: Schema + Extraction** | `docs/GRAPH_G1_SCHEMA_EXTRACTION.md` | Schema unification, entity extraction, back-pop | 400–600 |
+| **G2: Graph Ops** | `docs/GRAPH_G2_GRAPH_OPS.md` | NetworkX wrapper, PageRank, path/neighborhood queries, contradiction traversal | 250–400 |
+| **G3: Typed Relations** | `docs/GRAPH_G3_TYPED_RELS.md` | LLM-rel extraction, temporal reasoning, graph viz, entity lifecycle | 400–500 |
+
+| Feature | Notes |
+|---|---|
+| Graph memory | See phase docs above |
+| Mem0 OSS mirror integration | Project reference only — port entity_extraction.py piece by piece |
+| Local re-ranker (e.g. mxbai-rerank) | Post-MVP retrieval improvement |
+| Memory review queue (CLI + dashboard) | Post-MVP ops |
+| Cross-agent gateway hardening (OpenClaw / Agent Zero) | Post-MVP |
+| Document/transcript ingestion | Post-MVP |
+| LLM-based contradiction detection | Replaces heuristic in `contradict.py` with graph traversal |
+| Compression of raw JSONL after age threshold | Post-MVP storage |
